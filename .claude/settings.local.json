@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(dotnet --version)",
+      "Bash(npm --version)",
+      "Bash(dotnet new *)",
+      "Bash(dotnet sln *)",
+      "Bash(dotnet build *)",
+      "Bash(dotnet nuget *)",
+      "Bash(curl -s \"https://api.nuget.org/v3-flatcontainer/microsoft.aspnetcore.openapi/index.json\")",
+      "Bash(python3 -c \"import json,sys; print\\(json.load\\(sys.stdin\\)['versions'][-5:]\\)\")",
+      "Bash(npm create *)",
+      "Bash(npm install *)",
+      "Bash(npx tsc *)",
+      "Bash(npm run *)",
+      "Bash(dotnet test *)"
+    ]
+  }
+}
