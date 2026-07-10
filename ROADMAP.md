@@ -31,10 +31,24 @@ integration tests exist yet to need it); production connection string / secrets 
 
 ## Phase 2 — Walking-skeleton proxy (single provider, non-streaming)
 Prove the request path end-to-end before adding tenancy/auth/streaming on top of it.
-- [ ] `Api` proxies `POST /v1/chat/completions` to OpenAI, non-streaming, using one dev-config API key
-  (not yet tenant-scoped or BYOK)
-- [ ] Provider client abstraction (`IProviderClient`) in `src/Core`, OpenAI implementation
-- [ ] Basic integration test hitting the endpoint against a stubbed provider
+- [x] `Api` proxies `POST /v1/chat/completions` to OpenAI, non-streaming, using one dev-config API key
+  (not yet tenant-scoped or BYOK) — `Endpoints/ChatCompletionsEndpoint.cs`
+- [x] Provider client abstraction (`IProviderClient`) in `src/Core`, OpenAI implementation
+  (`Core/Providers/IProviderClient.cs`, `OpenAiProviderClient.cs`)
+- [x] Integration test hitting the endpoint against a stubbed provider
+  (`Api.Tests/ChatCompletionsEndpointTests.cs`, `WebApplicationFactory` + stub `IProviderClient`), plus a unit
+  test of `OpenAiProviderClient` itself against a fake `HttpMessageHandler`
+  (`Core.Tests/Providers/OpenAiProviderClientTests.cs`)
+- [x] Verified live: booted `Api`, confirmed malformed-JSON / missing-`model` / `stream:true` all return `400`
+  with a clear error body, and that a valid request without a configured OpenAI key fails clearly (`500` with
+  an `OptionsValidationException`) rather than hanging or silently misbehaving
+
+Found and fixed during verification: minimal-API endpoint parameters are resolved by DI *before* the handler
+body runs, so having `IProviderClient` as a bound parameter meant provider misconfiguration (`OptionsValidationException`
+from the missing API key) fired for *every* request — including ones that should have failed request validation
+first (missing `model`, malformed JSON, `stream:true`). Fixed by resolving `IProviderClient` lazily via
+`HttpContext.RequestServices` after validation passes. Worth remembering if more endpoints take service
+parameters that can throw during construction/configuration.
 
 ## Phase 3 — Multi-tenancy + BYOK credentials
 - [ ] `Management` API: tenant CRUD, API key issuance

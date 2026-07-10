@@ -16,20 +16,24 @@ out of order. Read both before making structural decisions (new projects, auth f
 
 ## Current state
 
-Phase 0 (solution scaffolding) and Phase 1 (core domain + persistence) are done — see `ROADMAP.md` for what's
-next. There is still no auth, provider client, rate limiting, or streaming; don't assume that infrastructure
-exists. Check `ROADMAP.md` before starting new work so you're building the current phase, not a later one out of
-order, and update it as phases complete. Update `ARCHITECTURE.md` too if you make a decision that resolves one
-of its "Open questions".
+Phase 0 (solution scaffolding), Phase 1 (core domain + persistence), and Phase 2 (walking-skeleton proxy) are
+done — see `ROADMAP.md` for what's next. There is still no auth, multi-provider support, rate limiting, or
+streaming; don't assume that infrastructure exists. Check `ROADMAP.md` before starting new work so you're
+building the current phase, not a later one out of order, and update it as phases complete. Update
+`ARCHITECTURE.md` too if you make a decision that resolves one of its "Open questions".
 
 ## Solution structure
 
 `src/Gateway.slnx` (new `.slnx` format) references all projects below. All .NET projects target `net10.0` with
 nullable reference types and implicit usings enabled.
 
-- `src/Api/` — ASP.NET Core Web API (`Microsoft.NET.Sdk.Web`). Will become the data-plane proxy. Currently only
-  has a stub endpoint: `GET /.well-known/ai-routing-configuration`. References `Core`, wired up to Postgres via
-  `AddGatewayPersistence`.
+- `src/Api/` — ASP.NET Core Web API (`Microsoft.NET.Sdk.Web`), the data-plane proxy. References `Core`, wired
+  up to Postgres via `AddGatewayPersistence`. Endpoints:
+  - `GET /.well-known/ai-routing-configuration` — stub, unimplemented.
+  - `POST /v1/chat/completions` (`Endpoints/ChatCompletionsEndpoint.cs`) — proxies to OpenAI via
+    `IProviderClient`. Non-streaming only (`stream:true` returns `400`); no tenant/auth/rate-limit awareness
+    yet — that's Phases 3–6. Validates the body is JSON with a `model` field, then passes it through to the
+    provider largely unchanged and mirrors back its status code and body.
 - `src/Management/` — ASP.NET Core Web API (`Microsoft.NET.Sdk.Web`). Will become the control-plane API.
   Currently only has a stub `GET /healthz`. References `Core`, wired up to Postgres via `AddGatewayPersistence`.
 - `src/Core/` — class library for shared domain code used by both `Api` and `Management`:
@@ -44,11 +48,28 @@ nullable reference types and implicit usings enabled.
     behavior per `ARCHITECTURE.md`'s multi-tenancy section; a caller must explicitly set a tenant or explicitly
     opt into `Unscoped` (trusted admin paths only) to see any rows. When adding a new tenant-owned entity, give
     it a `TenantId` column and add the same `HasQueryFilter` pattern in `GatewayDbContext.OnModelCreating`.
+  - `Providers/` — `IProviderClient` (request/response passed through as `JsonObject`, not fully typed — see
+    the doc comment on the interface for why), `OpenAiProviderClient`, `OpenAiProviderOptions`
+    (config key `Providers:OpenAI`, requires `ApiKey`), and `ServiceCollectionExtensions.AddOpenAiProviderClient`.
+    No API key is configured by default (nothing is committed) — calling `/v1/chat/completions` without setting
+    `Providers__OpenAI__ApiKey` (env var) or the equivalent config will fail with a clear
+    `OptionsValidationException`, not a silent hang.
 - `src/Dashboard/` — React + TypeScript SPA (Vite), for tenant self-service. Currently the unmodified Vite
   starter template, not wired to any API yet.
-- `src/Core.Tests/` — has real coverage of the tenant query-filter behavior (`Persistence/TenantScopeQueryFilterTests.cs`)
-  using the EF Core InMemory provider. `src/Api.Tests/`, `src/Management.Tests/` are still empty — expected
-  until those projects have logic to test.
+- `src/Core.Tests/` — covers the tenant query-filter behavior (`Persistence/TenantScopeQueryFilterTests.cs`,
+  EF Core InMemory provider) and `OpenAiProviderClient` (`Providers/OpenAiProviderClientTests.cs`, fake
+  `HttpMessageHandler`, no real network calls).
+- `src/Api.Tests/` — `ChatCompletionsEndpointTests.cs`, a `WebApplicationFactory<Program>` integration test that
+  swaps in a stub `IProviderClient` (via `services.RemoveAll<IProviderClient>()` in `ConfigureTestServices`) so
+  it never makes a real OpenAI call or needs Postgres running. `Program.cs` has `public partial class Program;`
+  at the bottom specifically to make it accessible to `WebApplicationFactory<Program>` — keep that if you touch
+  `Program.cs`.
+- `src/Management.Tests/` — still empty, expected until `Management` has logic to test.
+
+Endpoint handlers that take `HttpRequest`/services as minimal-API parameters have those resolved by DI **before**
+the handler body runs — don't add a service as a bound parameter if constructing it can fail in ways you want
+validated request data to short-circuit first (see `ChatCompletionsEndpoint.HandleAsync`, which resolves
+`IProviderClient` lazily via `HttpContext.RequestServices` after validation, specifically to avoid this).
 
 Note: `Microsoft.EntityFrameworkCore.Relational` is pinned explicitly in `Core/Core.csproj` (not just pulled in
 transitively via Npgsql/EFCore.Design) to avoid an assembly version conflict between what Npgsql's package floor
