@@ -1,6 +1,8 @@
 using Api.Endpoints;
+using Api.Observability;
 using Api.RateLimiting;
 using Core.Auth;
+using Core.Observability;
 using Core.Persistence;
 using Core.Providers;
 using Core.RateLimiting;
@@ -18,6 +20,8 @@ builder.Services.AddApiKeyAuthentication();
 builder.Services.AddManagedIdentityAuthentication(builder.Configuration);
 builder.Services.AddGatewayRateLimiting(builder.Configuration);
 builder.Services.AddScoped<RateLimitGate>();
+builder.Services.AddScoped<UsageEventRecorder>();
+builder.Services.AddGatewayObservability(builder.Configuration, serviceName: "ai-gateway-api");
 
 var app = builder.Build();
 

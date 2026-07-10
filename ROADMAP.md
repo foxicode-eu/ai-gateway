@@ -169,9 +169,30 @@ nonexistent tenant is rejected with `401`.
   record in the first place.
 
 ## Phase 7 — Observability & usage data
-- [ ] OpenTelemetry instrumentation (traces + metrics), OTLP export
-- [ ] Usage-event persistence (metadata only — no prompt/completion payloads)
-- [ ] `Management` API endpoints for querying usage
+- [x] OpenTelemetry instrumentation (traces + metrics), OTLP export (`Core/Observability` —
+  `AddGatewayObservability`, ASP.NET Core + HttpClient auto-instrumentation on both `Api`/`Management`, plus a
+  custom `AiGateway` `ActivitySource`/`Meter` on `Api` for `gateway.requests`/`gateway.request.duration`/
+  `gateway.tokens`, tagged tenant/provider/model/status. Exporter swappable `"Otlp"` (production) /
+  `"Console"` (local dev, same provider-swap pattern as `Secrets`/`RateLimiting`) via `Observability:Exporter`)
+- [x] Usage-event persistence, metadata only (`Core.Entities.UsageEvent` + `Api/Observability/UsageEventRecorder`
+  — tenant, API key if legacy-authenticated, provider, model, streamed flag, status code, prompt/completion
+  tokens, latency; never prompt/completion content)
+- [x] `Management` API endpoints for querying usage (`GET /tenants/{id}/usage?sinceHours=` — aggregate
+  totals + per-provider breakdown over a configurable window)
+- [x] Test coverage: 9 new tests (111 total) — `Api.Tests` covers usage-event correctness for successful,
+  streaming, rate-limited, and no-credential requests; `Management.Tests` covers the usage endpoint's
+  aggregation/grouping/time-window math and its `404`/`401` cases
+- [x] Verified live end-to-end: booted `Api` with `Observability:Exporter=Console`, made a real request, and
+  confirmed the console output showed the custom `chat.completion` span correctly nested under the ASP.NET Core
+  request span with the OpenAI `HttpClient` call nested under *that*, plus `gateway.requests`/
+  `gateway.request.duration` metrics emitted with the expected tags — not just that instrumentation compiled,
+  that it actually produces the nested-span shape you'd want in a real trace viewer. Also confirmed a
+  `usage_events` row landed in Postgres with the right data, and that `Management`'s usage endpoint correctly
+  reflected it (1 request, 1 error, grouped under `"openai"`).
+
+Not built (explicitly out of scope for this phase, tracked in `ARCHITECTURE.md`): per-tenant usage *dashboards*
+(no `Dashboard` project exists yet — this phase built the API a future one would call) and quota-threshold
+alerting (that's Phase 9).
 
 ## Phase 8 — Dashboard
 - [ ] `Dashboard` SPA wired to `Management` API: tenant onboarding, API key management

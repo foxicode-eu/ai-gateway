@@ -16,12 +16,12 @@ out of order. Read both before making structural decisions (new projects, auth f
 
 ## Current state
 
-Phases 0–6 are done (solution scaffolding, core domain + persistence, walking-skeleton proxy, multi-tenancy +
-BYOK credentials, JWT/managed-IdP auth, streaming, rate limiting) — see `ROADMAP.md` for what's next. `Api`
-accepts both a JWT and a legacy hashed API key (see "AuthN" below — this is a deliberate, temporary dual-scheme,
-not an oversight). Check `ROADMAP.md` before starting new work so you're building the current phase, not a later
-one out of order, and update it as phases complete. Update `ARCHITECTURE.md` too if you make a decision that
-resolves one of its "Open questions".
+Phases 0–7 are done (solution scaffolding, core domain + persistence, walking-skeleton proxy, multi-tenancy +
+BYOK credentials, JWT/managed-IdP auth, streaming, rate limiting, observability + usage data) — see
+`ROADMAP.md` for what's next. `Api` accepts both a JWT and a legacy hashed API key (see "AuthN" below — this is
+a deliberate, temporary dual-scheme, not an oversight). Check `ROADMAP.md` before starting new work so you're
+building the current phase, not a later one out of order, and update it as phases complete. Update
+`ARCHITECTURE.md` too if you make a decision that resolves one of its "Open questions".
 
 ## Solution structure
 
@@ -30,8 +30,9 @@ nullable reference types and implicit usings enabled.
 
 - `src/Api/` — ASP.NET Core Web API (`Microsoft.NET.Sdk.Web`), the data-plane proxy. References `Core`, wired
   up to Postgres via `AddGatewayPersistence`, providers via `AddProviderClients`, secrets via
-  `AddGatewaySecrets`, `AddApiKeyAuthentication` + `AddManagedIdentityAuthentication`, and rate limiting via
-  `AddGatewayRateLimiting` + a scoped `RateLimitGate`. Endpoints:
+  `AddGatewaySecrets`, `AddApiKeyAuthentication` + `AddManagedIdentityAuthentication`, rate limiting via
+  `AddGatewayRateLimiting` + a scoped `RateLimitGate`, and observability via `AddGatewayObservability` + a scoped
+  `UsageEventRecorder`. Endpoints:
   - `GET /.well-known/ai-routing-configuration` — stub, unimplemented.
   - `POST /v1/chat/completions` (`Endpoints/ChatCompletionsEndpoint.cs`) — requires `Authorization: Bearer
     <credential>`, enforced by `.AddEndpointFilter<TenantAuthenticationFilter>()`
@@ -45,8 +46,9 @@ nullable reference types and implicit usings enabled.
     heuristic, not real per-tenant config; see its doc comment); look up that tenant's BYOK credential via
     `ISecretStore`; then either `CreateChatCompletionAsync` (buffered `Results.Json`) or, if `stream:true`,
     `StreamChatCompletionAsync` via `Results.Stream(..., contentType: "text/event-stream")` — see "Streaming"
-    below. Either way, actual token usage is extracted from the response/stream and recorded via
-    `RateLimitGate.RecordUsageAsync` afterward.
+    below. Every exit point (rate-limited, no credential, completed) funnels through one local `FinishAsync`
+    helper in the handler that records metrics, a trace span status, a `UsageEvent` row, and rate-limit usage —
+    see "Observability & usage data" below — so those four things can't drift out of sync with each other.
 - `src/Management/` — ASP.NET Core Web API (`Microsoft.NET.Sdk.Web`), the control-plane API. References `Core`,
   wired the same way as `Api` (persistence, providers, secrets, `AddManagedIdentityAuthentication` — no
   `AddApiKeyAuthentication` or rate limiting; Management doesn't proxy chat requests). Every request runs
@@ -66,6 +68,10 @@ nullable reference types and implicit usings enabled.
   - `DELETE /tenants/{tenantId}/api-keys/{apiKeyId}` — revokes (soft: sets `RevokedAtUtc`).
   - `PUT /tenants/{tenantId}/providers/{providerName}` — stores a tenant's BYOK credential for that provider via
     `ISecretStore`, keyed by `ProviderCredentialSecretName.For(tenantId, providerName)`.
+  - `GET /tenants/{tenantId}/usage?sinceHours=<n>` (default 24) — aggregate usage over the window: total
+    requests/tokens/errors plus a per-provider breakdown. Reads `UsageEvent` rows `Api` writes — see
+    "Observability & usage data" below. Nothing renders this yet (`Dashboard` doesn't exist); it's the API a
+    future dashboard would call.
 - `src/DevTools/` — a small console app, **local development only**. `dotnet run --project src/DevTools --
   mint-token <tenant-id-guid>` mints a JWT signed with the same `Authentication:StaticKey` config `Api`/
   `Management` use, for manually testing authenticated `curl` requests. Deliberately not an HTTP endpoint on the
@@ -81,15 +87,16 @@ nullable reference types and implicit usings enabled.
     signing keys come from `{Authority}/.well-known/openid-configuration` via
     `ConfigurationManager<OpenIdConnectConfiguration>` (cached/auto-refreshed), the same mechanism ASP.NET
     Core's own JWT bearer handler uses — not hardcoded, not reinvented crypto.
-  - `Entities/` — `Tenant`, `ApiKey`, each with a nullable `TokenQuotaPerWindow` (see "Rate limiting" below;
-    null = unlimited).
+  - `Entities/` — `Tenant`, `ApiKey` (each with a nullable `TokenQuotaPerWindow` — see "Rate limiting" below;
+    null = unlimited), `UsageEvent` (see "Observability & usage data" below).
   - `RateLimiting/` — see the dedicated "Rate limiting" section below.
+  - `Observability/` — see the dedicated "Observability & usage data" section below.
   - `Persistence/` — `GatewayDbContext` (EF Core + Npgsql), `GatewayDbContextFactory` (design-time factory for
     `dotnet ef` tooling), `ServiceCollectionExtensions.AddGatewayPersistence` (DI registration), and
     `Migrations/` (EF Core migrations — commit these, don't hand-edit generated migration files).
   - `Tenancy/` — the multi-tenancy scoping mechanism: `TenantScope`/`TenantScopeMode` (`Blocked`,
     `SingleTenant`, `Unscoped`) and `ICurrentTenantAccessor` (default impl: `AsyncLocalCurrentTenantAccessor`).
-    `GatewayDbContext` applies a global query filter on tenant-owned entities (currently `ApiKey`) keyed off
+    `GatewayDbContext` applies a global query filter on tenant-owned entities (`ApiKey`, `UsageEvent`) keyed off
     the current scope. **The default/unset scope is `Blocked`, not `Unscoped`** — this is deliberate fail-closed
     behavior per `ARCHITECTURE.md`'s multi-tenancy section; a caller must explicitly set a tenant or explicitly
     opt into `Unscoped` (trusted admin paths only) to see any rows. When adding a new tenant-owned entity, give
@@ -198,6 +205,40 @@ tenant with no configured quota is not blocked and reaches the real provider hos
 same live wasn't practical without a real provider API key, since a failed provider call (the only kind
 possible with a fake key) never produces token usage to record.
 
+### Observability & usage data
+
+`Core/Observability`: `AddGatewayObservability(configuration, serviceName)` wires up OpenTelemetry — ASP.NET
+Core + HttpClient auto-instrumentation (so every inbound request and every outbound call to a provider gets a
+trace span automatically, e.g. the `HttpClient` span to `api.openai.com` shows up as a child of the request that
+triggered it) plus `GatewayDiagnostics`'s custom `AiGateway` `ActivitySource`/`Meter`
+(`gateway.requests` counter, `gateway.request.duration` histogram, `gateway.tokens` counter — tagged
+`tenant_id`/`provider`/`model`/`status_code`, or `tenant_id`/`token_type` for the token counter). Exporter is
+`Observability:Exporter` = `"Otlp"` (production, a real collector at `Observability:OtlpEndpoint`) or
+`"Console"` (local dev — prints traces/metrics to stdout, which is how this was actually verified live: booted
+`Api`, made a real request, and confirmed the console output showed the custom `chat.completion` span correctly
+nested under the ASP.NET Core request span, the OpenAI `HttpClient` span nested under *that*, and
+`gateway.requests`/`gateway.request.duration` emitted with the expected tags). Both `Api` and `Management` call
+`AddGatewayObservability`, but only `Api` emits `GatewayDiagnostics` metrics — `Management` gets the generic
+ASP.NET Core instrumentation only, since it doesn't proxy chat requests.
+
+Payload privacy is load-bearing here, not just a policy statement: nothing in any span tag, metric tag, or log
+message carries prompt/completion content — only identifiers, counts, and status codes. Keep it that way if you
+add more instrumentation.
+
+`Core.Entities.UsageEvent` / `Api/Observability/UsageEventRecorder.cs`: one row per chat completion request that
+reached tenant+provider resolution (requests that fail body validation before that — bad JSON, missing `model`
+— aren't recorded; there's no tenant/provider context for them yet). `ChatCompletionsEndpoint.HandleAsync` has a
+single local `FinishAsync` helper that every exit point (rate-limited `429`, no-credential `400`, and the
+completed/streamed cases) funnels through — it's the one place that records the metric, closes out the trace
+span, writes the `UsageEvent`, and calls `RateLimitGate.RecordUsageAsync`, specifically so those four things
+can't drift out of sync by one exit path forgetting one of them.
+
+`Management`'s `GET /tenants/{tenantId}/usage` endpoint (`Endpoints/UsageEndpoint.cs`) aggregates `UsageEvent`
+rows over a configurable window (`?sinceHours=`, default 24): total requests/tokens/errors, plus a per-provider
+breakdown. **Verified live end-to-end**: made a real (failing, fake-key) request through `Api`, confirmed a
+`usage_events` row landed in Postgres with the correct provider/model/status code, and confirmed `Management`'s
+usage endpoint reflected it correctly (1 request, 1 error, grouped under `"openai"`).
+
 - `src/Dashboard/` — React + TypeScript SPA (Vite), for tenant self-service. Currently the unmodified Vite
   starter template, not wired to any API yet.
 - `src/Core.Tests/` — covers the tenant query-filter behavior, both provider clients incl. streaming (fake
@@ -224,7 +265,9 @@ possible with a fake key) never produces token usage to record.
   "can we still change status code from inside the stream callback" assumption lives), and rate limiting
   (overrides `IRateLimitStore` with `InMemoryRateLimitStore` to avoid a real Redis dependency in tests — tenant
   quota blocking, api-key quota blocking with room left on the tenant, no-quota-configured passthrough, and JWT
-  auth not being subject to a per-key quota). Tests that reach into `GatewayDbContext` directly outside of an
+  auth not being subject to a per-key quota), and usage-event persistence (asserts the `UsageEvent` row written
+  for successful, streaming, rate-limited, and no-credential requests has the right tenant/provider/model/status/
+  token/streamed values). Tests that reach into `GatewayDbContext` directly outside of an
   HTTP request (e.g. to set a quota mid-test) need `.IgnoreQueryFilters()` on `ApiKeys` queries — there's no
   ambient `TenantScope` in a bare `CreateScope()`, so the fail-closed default (`Blocked`) hides everything,
   same underlying mechanism as the `Tenancy` bullet above, just easy to trip over again in a new spot.
@@ -234,9 +277,10 @@ possible with a fake key) never produces token usage to record.
   swap pattern as `Api.Tests`, plus an in-memory `ISecretStore` and its own test-owned `"StaticKey"` auth config)
   exposes `CreateAuthenticatedClient()` (an `HttpClient` pre-authenticated with a JWT minted via
   `LocalDevTokenIssuer`) alongside the inherited `CreateClient()` for testing the unauthenticated case. Endpoint
-  tests per resource (`TenantsEndpointTests`, `ApiKeysEndpointTests`, `ProviderCredentialsEndpointTests`) all use
-  the authenticated client; each also has (or `TenantsEndpointTests` has, covering the shared filter) a test
-  asserting `401` without a token.
+  tests per resource (`TenantsEndpointTests`, `ApiKeysEndpointTests`, `ProviderCredentialsEndpointTests`,
+  `UsageEndpointTests`) all use the authenticated client; each also has (or `TenantsEndpointTests` has, covering
+  the shared filter) a test asserting `401` without a token. `UsageEndpointTests` seeds `UsageEvent` rows
+  directly (bypassing `Api`) and checks the aggregation/grouping/time-window-filtering math.
   **Gotcha already hit once:** generate the InMemory database name *once* (e.g. a field, computed outside the
   `AddDbContext` configure lambda) and reuse it — generating it inline inside the lambda (`UseInMemoryDatabase(Guid.NewGuid().ToString())`)
   means every time EF Core re-invokes that delegate you silently get a fresh, empty database, so data written by
@@ -298,6 +342,10 @@ dotnet ef database update --project src/Core --startup-project src/Core
 `GatewayDbContextFactory` (used by the `dotnet ef` commands above) reads the connection string from the
 `GATEWAY_DB_CONNECTION_STRING` env var, falling back to the same local dev default if unset.
 
+Both dev configs also default `Observability:Exporter` to `"Console"` — running either service locally prints
+OpenTelemetry trace/metric output to stdout, no collector needed. Switch to `"Otlp"` (+ `Observability:OtlpEndpoint`)
+to point at a real collector.
+
 To inspect rate-limit counters directly: `docker exec ai-gateway-redis-1 redis-cli KEYS 'ratelimit:*'` (keys are
 `ratelimit:tenant:{tenantId:N}:{windowIndex}` / `ratelimit:apikey:{apiKeyId:N}:{windowIndex}`, see
 `RateLimitGate`/`TokenRateLimiter`).
@@ -329,6 +377,9 @@ DATA_PLANE_TOKEN=$(dotnet run --project src/DevTools -- mint-token <tenantId>)
 curl -X POST http://localhost:5298/v1/chat/completions \
   -H "Authorization: Bearer $DATA_PLANE_TOKEN" -H "Content-Type: application/json" \
   -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}'
+
+# check what got recorded
+curl http://localhost:5299/tenants/<tenantId>/usage -H "Authorization: Bearer $ADMIN_TOKEN"
 ```
 
 Both `Api` and `Management` default to `Secrets:Provider = "LocalDev"` in `appsettings.Development.json`, storing

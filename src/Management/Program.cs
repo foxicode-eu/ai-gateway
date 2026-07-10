@@ -1,4 +1,5 @@
 using Core.Auth;
+using Core.Observability;
 using Core.Persistence;
 using Core.Providers;
 using Core.Secrets;
@@ -14,6 +15,7 @@ builder.Services.AddGatewayPersistence(connectionString);
 builder.Services.AddProviderClients(builder.Configuration);
 builder.Services.AddGatewaySecrets(builder.Configuration);
 builder.Services.AddManagedIdentityAuthentication(builder.Configuration);
+builder.Services.AddGatewayObservability(builder.Configuration, serviceName: "ai-gateway-management");
 
 var app = builder.Build();
 
@@ -32,6 +34,7 @@ var tenantsGroup = app.MapGroup("/tenants").AddEndpointFilter<AdminAuthenticatio
 tenantsGroup.MapTenants();
 tenantsGroup.MapApiKeys();
 tenantsGroup.MapProviderCredentials();
+tenantsGroup.MapUsage();
 
 app.Run();
 

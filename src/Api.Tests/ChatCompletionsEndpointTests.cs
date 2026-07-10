@@ -445,4 +445,84 @@ public class ChatCompletionsEndpointTests : IClassFixture<WebApplicationFactory<
 
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
     }
+
+    private async Task<UsageEvent> GetLatestUsageEventAsync()
+    {
+        using var scope = _factory.Services.CreateScope();
+        var dbContext = scope.ServiceProvider.GetRequiredService<GatewayDbContext>();
+        return await dbContext.UsageEvents.IgnoreQueryFilters().OrderByDescending(e => e.CreatedAtUtc).FirstAsync();
+    }
+
+    [Fact]
+    public async Task Records_a_usage_event_for_a_successful_request()
+    {
+        _stubOpenAiClient.Response = new ProviderResponse(200, new JsonObject
+        {
+            ["id"] = "resp-1",
+            ["usage"] = new JsonObject { ["prompt_tokens"] = 7, ["completion_tokens"] = 4 },
+        });
+        var client = CreateAuthenticatedClient();
+
+        await client.PostAsync(
+            "/v1/chat/completions", new StringContent("""{"model":"gpt-4o-mini"}""", Encoding.UTF8, "application/json"));
+
+        var usageEvent = await GetLatestUsageEventAsync();
+        Assert.Equal(_tenantId, usageEvent.TenantId);
+        Assert.Equal("openai", usageEvent.Provider);
+        Assert.Equal("gpt-4o-mini", usageEvent.Model);
+        Assert.False(usageEvent.Streamed);
+        Assert.Equal(200, usageEvent.StatusCode);
+        Assert.Equal(7, usageEvent.PromptTokens);
+        Assert.Equal(4, usageEvent.CompletionTokens);
+        Assert.True(usageEvent.LatencyMs >= 0);
+    }
+
+    [Fact]
+    public async Task Records_a_usage_event_for_a_streaming_request()
+    {
+        var client = CreateAuthenticatedClient();
+
+        await client.PostAsync(
+            "/v1/chat/completions", new StringContent("""{"model":"gpt-4o-mini","stream":true}""", Encoding.UTF8, "application/json"));
+
+        var usageEvent = await GetLatestUsageEventAsync();
+        Assert.True(usageEvent.Streamed);
+        Assert.Equal(_stubOpenAiClient.StreamedUsage!.PromptTokens, usageEvent.PromptTokens);
+        Assert.Equal(_stubOpenAiClient.StreamedUsage!.CompletionTokens, usageEvent.CompletionTokens);
+    }
+
+    [Fact]
+    public async Task Records_a_zero_token_usage_event_when_rate_limited()
+    {
+        using (var scope = _factory.Services.CreateScope())
+        {
+            var dbContext = scope.ServiceProvider.GetRequiredService<GatewayDbContext>();
+            var tenant = await dbContext.Tenants.FirstAsync(t => t.Id == _tenantId);
+            tenant.TokenQuotaPerWindow = 0;
+            await dbContext.SaveChangesAsync();
+        }
+        var client = CreateAuthenticatedClient();
+
+        await client.PostAsync(
+            "/v1/chat/completions", new StringContent("""{"model":"gpt-4o-mini"}""", Encoding.UTF8, "application/json"));
+
+        var usageEvent = await GetLatestUsageEventAsync();
+        Assert.Equal(429, usageEvent.StatusCode);
+        Assert.Equal(0, usageEvent.PromptTokens);
+        Assert.Equal(0, usageEvent.CompletionTokens);
+    }
+
+    [Fact]
+    public async Task Records_a_usage_event_when_no_provider_credential_is_configured()
+    {
+        var client = CreateAuthenticatedClient();
+
+        await client.PostAsync(
+            "/v1/chat/completions",
+            new StringContent("""{"model":"claude-3-5-sonnet-20241022"}""", Encoding.UTF8, "application/json"));
+
+        var usageEvent = await GetLatestUsageEventAsync();
+        Assert.Equal("anthropic", usageEvent.Provider);
+        Assert.Equal(400, usageEvent.StatusCode);
+    }
 }

@@ -117,15 +117,31 @@ never expose a token-issuing HTTP endpoint.
 
 ## Observability & usage data
 
-- Instrumented with **OpenTelemetry**, exporting traces/metrics via OTLP, so the backend (Azure Monitor,
-  Grafana/Prometheus, Datadog, ...) can be swapped without re-instrumenting.
-- Metrics tracked per tenant/API-key/provider/model: request count, latency, tokens in/out, error rate.
-- **Payload privacy**: only request/response *metadata* is stored (token counts, latency, model, status code).
-  Prompt and completion content is never persisted — this is a hard rule given the gateway handles arbitrary
-  customer data across many tenants, not just a nice-to-have.
+- Instrumented with **OpenTelemetry** (`Core/Observability`) — ASP.NET Core + HttpClient auto-instrumentation on
+  both `Api` and `Management`, plus a custom `AiGateway` `ActivitySource`/`Meter` for gateway-specific spans and
+  metrics on `Api` (`Management` doesn't proxy chat requests, so it has nothing gateway-specific to emit).
+  Exporter is swappable (`Observability:Exporter` = `"Otlp"` production / `"Console"` local dev — same
+  provider-swap pattern used for `Secrets` and `RateLimiting`), so the backend (Azure Monitor, Grafana/
+  Prometheus, Datadog, ...) can be swapped without re-instrumenting.
+- Metrics tracked per tenant/provider/model/status code: request count, latency, tokens in/out (`gateway.requests`,
+  `gateway.request.duration`, `gateway.tokens`). Not yet broken out per-API-key as a separate dimension — tenant
+  is the primary axis today; revisit if per-key metric drill-down turns out to matter in practice. Tagging every
+  metric with `tenant_id` is a known cardinality trade-off (one time series per tenant × provider × model ×
+  status combination) — acceptable at this stage, worth revisiting if tenant count grows large.
+- **Payload privacy**: only request/response *metadata* is stored (token counts, latency, model, status code) —
+  both in trace/metric tags and in the persisted `UsageEvent` records below. Prompt and completion content is
+  never persisted — this is a hard rule given the gateway handles arbitrary customer data across many tenants,
+  not just a nice-to-have.
+- **Usage-event persistence**: every chat completion request that resolves to a tenant + provider (i.e. not ones
+  that fail basic request validation before that point) is recorded as a `UsageEvent` row — tenant, API key (if
+  the legacy scheme was used), provider, model, streamed flag, status code, prompt/completion tokens, latency.
+  Metadata only, same rule as above.
 - Usage data feeds:
-  - Per-tenant usage dashboards (via `Management` API, rendered in `Dashboard`).
-  - Quota-threshold alerting (e.g. webhook/email when a tenant approaches its limit).
+  - Per-tenant usage queries (`GET /tenants/{id}/usage` on `Management` — aggregate totals + a per-provider
+    breakdown over a configurable time window). Not yet rendered anywhere (`Dashboard` doesn't exist yet — see
+    its own phase); this is the API a future dashboard would call.
+  - Quota-threshold alerting (e.g. webhook/email when a tenant approaches its limit) — **not built yet**, that's
+    Phase 9.
 
 ## Deployment
 
