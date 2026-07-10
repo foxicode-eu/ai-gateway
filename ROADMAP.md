@@ -17,10 +17,17 @@ Get the multi-project structure in place and building, with no business logic ye
 
 ## Phase 1 — Core domain + persistence
 No proxying, no auth yet — just the data model everything else depends on.
-- [ ] Postgres integration (EF Core `DbContext` in `src/Core`)
-- [ ] `Tenant` and `ApiKey` entities, initial migration
-- [ ] Global query filters for `tenant_id` scoping
-- [ ] Local dev Postgres via Docker Compose
+- [x] Postgres integration (EF Core `GatewayDbContext` in `src/Core/Persistence`, Npgsql provider)
+- [x] `Tenant` and `ApiKey` entities, initial migration (`InitialCreate`, verified applying against real Postgres)
+- [x] Global query filters for `tenant_id` scoping (`Core/Tenancy`: fail-closed `TenantScope`/
+  `ICurrentTenantAccessor`, covered by tests in `Core.Tests/Persistence/TenantScopeQueryFilterTests.cs`)
+- [x] Local dev Postgres via Docker Compose (`docker-compose.yml` at repo root)
+- [x] `Api` and `Management` wired to persistence via `AddGatewayPersistence`, verified booting against the
+  local Postgres
+
+Not done, deferred to later phases: CI does not yet run against a real Postgres or apply migrations (no
+integration tests exist yet to need it); production connection string / secrets handling is still the
+`ConnectionStrings:Gateway` dev default — real secrets management is Phase 3+ (Key Vault) territory.
 
 ## Phase 2 — Walking-skeleton proxy (single provider, non-streaming)
 Prove the request path end-to-end before adding tenancy/auth/streaming on top of it.

@@ -13,7 +13,12 @@
       "Bash(npm install *)",
       "Bash(npx tsc *)",
       "Bash(npm run *)",
-      "Bash(dotnet test *)"
+      "Bash(dotnet test *)",
+      "Bash(docker --version)",
+      "Bash(docker compose *)",
+      "Bash(dotnet tool *)",
+      "Bash(dotnet list *)",
+      "Bash(dotnet add *)"
     ]
   }
 }

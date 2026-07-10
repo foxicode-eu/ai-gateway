@@ -16,11 +16,11 @@ out of order. Read both before making structural decisions (new projects, auth f
 
 ## Current state
 
-Phase 0 (solution scaffolding) is done: all projects described in `ARCHITECTURE.md` exist and build, but contain
-no business logic yet — no tenant model, auth, provider client, rate limiting, or persistence layer. Don't assume
-supporting infrastructure already exists beyond what's listed below; check `ROADMAP.md` for what phase is next
-and update it as phases complete. Update `ARCHITECTURE.md` too if you make a decision that resolves one of its
-"Open questions".
+Phase 0 (solution scaffolding) and Phase 1 (core domain + persistence) are done — see `ROADMAP.md` for what's
+next. There is still no auth, provider client, rate limiting, or streaming; don't assume that infrastructure
+exists. Check `ROADMAP.md` before starting new work so you're building the current phase, not a later one out of
+order, and update it as phases complete. Update `ARCHITECTURE.md` too if you make a decision that resolves one
+of its "Open questions".
 
 ## Solution structure
 
@@ -28,15 +28,32 @@ and update it as phases complete. Update `ARCHITECTURE.md` too if you make a dec
 nullable reference types and implicit usings enabled.
 
 - `src/Api/` — ASP.NET Core Web API (`Microsoft.NET.Sdk.Web`). Will become the data-plane proxy. Currently only
-  has a stub endpoint: `GET /.well-known/ai-routing-configuration`. References `Core`.
+  has a stub endpoint: `GET /.well-known/ai-routing-configuration`. References `Core`, wired up to Postgres via
+  `AddGatewayPersistence`.
 - `src/Management/` — ASP.NET Core Web API (`Microsoft.NET.Sdk.Web`). Will become the control-plane API.
-  Currently only has a stub `GET /healthz`. References `Core`.
-- `src/Core/` — class library for shared domain code (tenant/domain model, provider client abstractions,
-  rate-limit primitives) used by both `Api` and `Management`. Currently empty.
+  Currently only has a stub `GET /healthz`. References `Core`, wired up to Postgres via `AddGatewayPersistence`.
+- `src/Core/` — class library for shared domain code used by both `Api` and `Management`:
+  - `Entities/` — `Tenant`, `ApiKey`.
+  - `Persistence/` — `GatewayDbContext` (EF Core + Npgsql), `GatewayDbContextFactory` (design-time factory for
+    `dotnet ef` tooling), `ServiceCollectionExtensions.AddGatewayPersistence` (DI registration), and
+    `Migrations/` (EF Core migrations — commit these, don't hand-edit generated migration files).
+  - `Tenancy/` — the multi-tenancy scoping mechanism: `TenantScope`/`TenantScopeMode` (`Blocked`,
+    `SingleTenant`, `Unscoped`) and `ICurrentTenantAccessor` (default impl: `AsyncLocalCurrentTenantAccessor`).
+    `GatewayDbContext` applies a global query filter on tenant-owned entities (currently `ApiKey`) keyed off
+    the current scope. **The default/unset scope is `Blocked`, not `Unscoped`** — this is deliberate fail-closed
+    behavior per `ARCHITECTURE.md`'s multi-tenancy section; a caller must explicitly set a tenant or explicitly
+    opt into `Unscoped` (trusted admin paths only) to see any rows. When adding a new tenant-owned entity, give
+    it a `TenantId` column and add the same `HasQueryFilter` pattern in `GatewayDbContext.OnModelCreating`.
 - `src/Dashboard/` — React + TypeScript SPA (Vite), for tenant self-service. Currently the unmodified Vite
   starter template, not wired to any API yet.
-- `src/Core.Tests/`, `src/Api.Tests/`, `src/Management.Tests/` — xUnit test projects, one per matching
-  non-test project. Currently empty (no test files) — this is expected until each project has logic to test.
+- `src/Core.Tests/` — has real coverage of the tenant query-filter behavior (`Persistence/TenantScopeQueryFilterTests.cs`)
+  using the EF Core InMemory provider. `src/Api.Tests/`, `src/Management.Tests/` are still empty — expected
+  until those projects have logic to test.
+
+Note: `Microsoft.EntityFrameworkCore.Relational` is pinned explicitly in `Core/Core.csproj` (not just pulled in
+transitively via Npgsql/EFCore.Design) to avoid an assembly version conflict between what Npgsql's package floor
+resolves and what EFCore.Design expects. If you add another EF-related package and see `MSB3277` conflict
+warnings, pin the conflicting package version in `Core.csproj` rather than in downstream projects.
 
 ## Commands
 
@@ -65,5 +82,23 @@ npm run dev       # local dev server
 npm run build     # production build (tsc -b && vite build)
 ```
 
+### Local Postgres + EF Core migrations
+
+`docker-compose.yml` (repo root) runs a local Postgres for development, matching the connection string in
+`src/Api/appsettings.Development.json` and `src/Management/appsettings.Development.json`
+(`Host=localhost;Port=5432;Database=ai_gateway;Username=ai_gateway;Password=ai_gateway` — dev-only credentials).
+
+```bash
+docker compose up -d          # start local Postgres (from repo root)
+
+# EF Core tooling (dotnet-ef is a local tool — see .config/dotnet-tools.json; run `dotnet tool restore` once)
+dotnet ef migrations add <Name> --project src/Core --startup-project src/Core --output-dir Persistence/Migrations
+dotnet ef database update --project src/Core --startup-project src/Core
+```
+
+`GatewayDbContextFactory` (used by the `dotnet ef` commands above) reads the connection string from the
+`GATEWAY_DB_CONNECTION_STRING` env var, falling back to the same local dev default if unset.
+
 CI (`.github/workflows/ci.yml`) runs `dotnet build`/`dotnet test` on the solution and `npm run build` on the
-Dashboard for every PR.
+Dashboard for every PR. It does not currently run against a real Postgres instance or apply migrations — that's
+an open gap, not a deliberate decision; revisit if/when integration tests need a real database in CI.
