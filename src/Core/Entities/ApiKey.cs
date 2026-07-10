@@ -18,4 +18,10 @@ public class ApiKey
     public DateTimeOffset? RevokedAtUtc { get; set; }
 
     public bool IsActive => RevokedAtUtc is null;
+
+    /// <summary>
+    /// Optional finer-grained quota for just this key, on top of (not instead of) the tenant's own
+    /// <see cref="Tenant.TokenQuotaPerWindow"/> — both are checked independently. Null means no per-key limit.
+    /// </summary>
+    public int? TokenQuotaPerWindow { get; set; }
 }

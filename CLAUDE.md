@@ -16,12 +16,12 @@ out of order. Read both before making structural decisions (new projects, auth f
 
 ## Current state
 
-Phases 0–5 are done (solution scaffolding, core domain + persistence, walking-skeleton proxy, multi-tenancy +
-BYOK credentials, JWT/managed-IdP auth, streaming) — see `ROADMAP.md` for what's next. There is still no rate
-limiting. `Api` accepts both a JWT and a legacy hashed API key (see "AuthN" below — this is a deliberate,
-temporary dual-scheme, not an oversight). Check `ROADMAP.md` before starting new work so you're building the
-current phase, not a later one out of order, and update it as phases complete. Update `ARCHITECTURE.md` too if
-you make a decision that resolves one of its "Open questions".
+Phases 0–6 are done (solution scaffolding, core domain + persistence, walking-skeleton proxy, multi-tenancy +
+BYOK credentials, JWT/managed-IdP auth, streaming, rate limiting) — see `ROADMAP.md` for what's next. `Api`
+accepts both a JWT and a legacy hashed API key (see "AuthN" below — this is a deliberate, temporary dual-scheme,
+not an oversight). Check `ROADMAP.md` before starting new work so you're building the current phase, not a later
+one out of order, and update it as phases complete. Update `ARCHITECTURE.md` too if you make a decision that
+resolves one of its "Open questions".
 
 ## Solution structure
 
@@ -30,21 +30,26 @@ nullable reference types and implicit usings enabled.
 
 - `src/Api/` — ASP.NET Core Web API (`Microsoft.NET.Sdk.Web`), the data-plane proxy. References `Core`, wired
   up to Postgres via `AddGatewayPersistence`, providers via `AddProviderClients`, secrets via
-  `AddGatewaySecrets`, and both `AddApiKeyAuthentication` and `AddManagedIdentityAuthentication`. Endpoints:
+  `AddGatewaySecrets`, `AddApiKeyAuthentication` + `AddManagedIdentityAuthentication`, and rate limiting via
+  `AddGatewayRateLimiting` + a scoped `RateLimitGate`. Endpoints:
   - `GET /.well-known/ai-routing-configuration` — stub, unimplemented.
   - `POST /v1/chat/completions` (`Endpoints/ChatCompletionsEndpoint.cs`) — requires `Authorization: Bearer
     <credential>`, enforced by `.AddEndpointFilter<TenantAuthenticationFilter>()`
     (`Authentication/TenantAuthenticationFilter.cs`). The credential is either a JWT (3 dot-separated segments —
     validated via `IJwtAccessTokenValidator`, tenant resolved from its `tenant_id` claim, then checked against
     real tenants in the DB) or a legacy hashed API key (`IApiKeyAuthenticator`, from Phase 3) — see "AuthN" below
-    for why both exist. Once the tenant is resolved: pick a provider from the model name
-    (`Core.Providers.ProviderRouting` — currently a `"claude*" → anthropic, else → openai` heuristic, not real
-    per-tenant config; see its doc comment), look up that tenant's BYOK credential via `ISecretStore`, then either
-    `CreateChatCompletionAsync` (buffered `Results.Json`) or, if `stream:true`, `StreamChatCompletionAsync` via
-    `Results.Stream(..., contentType: "text/event-stream")` — see "Streaming" below.
+    for why both exist. The filter stashes an `Authentication/AuthenticatedTenant` (`TenantId` + optional
+    `ApiKeyId`, the latter only ever set for the legacy scheme) in `HttpContext.Items`. Once the tenant is
+    resolved: `RateLimitGate.CheckAsync` (see "Rate limiting" below) — `429` if over quota; pick a provider from
+    the model name (`Core.Providers.ProviderRouting` — currently a `"claude*" → anthropic, else → openai`
+    heuristic, not real per-tenant config; see its doc comment); look up that tenant's BYOK credential via
+    `ISecretStore`; then either `CreateChatCompletionAsync` (buffered `Results.Json`) or, if `stream:true`,
+    `StreamChatCompletionAsync` via `Results.Stream(..., contentType: "text/event-stream")` — see "Streaming"
+    below. Either way, actual token usage is extracted from the response/stream and recorded via
+    `RateLimitGate.RecordUsageAsync` afterward.
 - `src/Management/` — ASP.NET Core Web API (`Microsoft.NET.Sdk.Web`), the control-plane API. References `Core`,
   wired the same way as `Api` (persistence, providers, secrets, `AddManagedIdentityAuthentication` — no
-  `AddApiKeyAuthentication`, Management doesn't accept the legacy scheme). Every request runs
+  `AddApiKeyAuthentication` or rate limiting; Management doesn't proxy chat requests). Every request runs
   `TenantScope.Unscoped` (set by middleware in `Program.cs`) — Management is the trusted control plane and
   operates across tenants by design. All `/tenants/**` routes are grouped (`app.MapGroup("/tenants")` in
   `Program.cs`) and require a valid JWT via `.AddEndpointFilter<AdminAuthenticationFilter>()`
@@ -52,9 +57,12 @@ nullable reference types and implicit usings enabled.
   operate on any tenant; there's no per-tenant admin restriction yet (open item in `ARCHITECTURE.md`). `/healthz`
   is outside the group and stays unauthenticated. Endpoints (all under `Endpoints/`, registered with paths
   *relative* to the `/tenants` group — e.g. `""` for the group root, `/{tenantId:guid}` for a specific tenant):
-  - `POST /tenants`, `GET /tenants/{tenantId}` — tenant CRUD (create/read only so far).
-  - `POST /tenants/{tenantId}/api-keys` — issues a key; the plaintext is only ever in this one response
-    (`ApiKeyGenerator.GenerateSecret()`/`.Hash()` in `Core/Security`) — the DB stores only the hash.
+  - `POST /tenants`, `GET /tenants/{tenantId}`, `PATCH /tenants/{tenantId}` — tenant CRUD (no delete). Create
+    and patch both accept an optional `tokenQuotaPerWindow` (null = unlimited; `PATCH` with `null` clears it
+    back to unlimited — it's not "unset means don't change", the field is always applied as given).
+  - `POST /tenants/{tenantId}/api-keys`, `PATCH /tenants/{tenantId}/api-keys/{apiKeyId}` — issues a key (the
+    plaintext is only ever in the create response — `ApiKeyGenerator.GenerateSecret()`/`.Hash()` in
+    `Core/Security`, the DB stores only the hash) and updates its own optional `tokenQuotaPerWindow`.
   - `DELETE /tenants/{tenantId}/api-keys/{apiKeyId}` — revokes (soft: sets `RevokedAtUtc`).
   - `PUT /tenants/{tenantId}/providers/{providerName}` — stores a tenant's BYOK credential for that provider via
     `ISecretStore`, keyed by `ProviderCredentialSecretName.For(tenantId, providerName)`.
@@ -73,7 +81,9 @@ nullable reference types and implicit usings enabled.
     signing keys come from `{Authority}/.well-known/openid-configuration` via
     `ConfigurationManager<OpenIdConnectConfiguration>` (cached/auto-refreshed), the same mechanism ASP.NET
     Core's own JWT bearer handler uses — not hardcoded, not reinvented crypto.
-  - `Entities/` — `Tenant`, `ApiKey`.
+  - `Entities/` — `Tenant`, `ApiKey`, each with a nullable `TokenQuotaPerWindow` (see "Rate limiting" below;
+    null = unlimited).
+  - `RateLimiting/` — see the dedicated "Rate limiting" section below.
   - `Persistence/` — `GatewayDbContext` (EF Core + Npgsql), `GatewayDbContextFactory` (design-time factory for
     `dotnet ef` tooling), `ServiceCollectionExtensions.AddGatewayPersistence` (DI registration), and
     `Migrations/` (EF Core migrations — commit these, don't hand-edit generated migration files).
@@ -155,8 +165,39 @@ nullable reference types and implicit usings enabled.
   against real `api.openai.com`/`api.anthropic.com` with intentionally-invalid keys: both correctly return the
   real status code (`401`) with `Content-Type: application/json` (not `text/event-stream`), and the Anthropic
   error body is correctly translated into the OpenAI-shaped `{"error": {...}}` form.
-- Token usage is logged (`ILogger`, Information level) once a stream completes successfully — there's no
-  metrics/rate-limiting consumer for it yet (Phases 6/7); this just establishes where that hook goes.
+- Token usage is logged (`ILogger`, Information level) once a stream completes successfully, and fed into
+  `RateLimitGate.RecordUsageAsync` (see "Rate limiting" below). There's still no usage-metrics consumer beyond
+  rate limiting (that's Phase 7).
+
+### Rate limiting
+
+`Core/RateLimiting`: `ITokenRateLimiter`/`TokenRateLimiter` (the sliding-window-counter algorithm — a weighted
+blend of current + previous fixed-window counts, O(1) store ops per check, the standard practical approximation
+of a true sliding window; see the class doc comment) built on `IRateLimitStore` (`RedisRateLimitStore` for
+production, `InMemoryRateLimitStore` for local dev/tests — selected by `RateLimiting:Store` config, same
+provider-swap pattern as `Secrets`). `AddGatewayRateLimiting` wires it up; only `Api` uses it (`Management`
+doesn't proxy chat requests, so it has no rate limiting to enforce).
+
+`Api/RateLimiting/RateLimitGate.cs` is the piece that actually resolves configured quotas from the DB
+(`Tenant.TokenQuotaPerWindow`, `ApiKey.TokenQuotaPerWindow` — both nullable, null = unlimited) and calls the
+limiter. `CheckAsync` returns a `RateLimitCheckResult` carrying the resolved quota values so `RecordUsageAsync`
+doesn't need a second DB round trip to know whether either counter should be written to. Quota check happens
+*before* proxying to the provider (necessarily an estimate — actual token count isn't known until the
+completion finishes); usage is recorded *after*, extracted from the response's `"usage"` object (present in
+every real OpenAI-shaped response, both native and Anthropic-translated) for non-streaming, or from the
+`StreamUsage` returned by `StreamChatCompletionAsync` for streaming. A request that errors before producing a
+`usage` object (bad BYOK credential, provider rejects it, etc.) records zero usage — quota tracks actual
+consumption, not attempts.
+
+**Verified live against real Redis** (not just the `InMemory` test double): booted `Api` against the
+`docker-compose` Redis service, created a tenant with a small quota via `Management`, manually seeded a Redis
+counter key past the quota threshold (`ratelimit:tenant:{tenantId:N}:{windowIndex}` — matching the format
+`TokenRateLimiter` actually uses) and confirmed a live request was correctly blocked with `429`; confirmed a
+tenant with no configured quota is not blocked and reaches the real provider host. Full consumption-tracking
+(record → later check sees updated usage) is covered in `Api.Tests` against `InMemoryRateLimitStore` — doing the
+same live wasn't practical without a real provider API key, since a failed provider call (the only kind
+possible with a fake key) never produces token usage to record.
+
 - `src/Dashboard/` — React + TypeScript SPA (Vite), for tenant self-service. Currently the unmodified Vite
   starter template, not wired to any API yet.
 - `src/Core.Tests/` — covers the tenant query-filter behavior, both provider clients incl. streaming (fake
@@ -166,7 +207,9 @@ nullable reference types and implicit usings enabled.
   resulting OpenAI-shaped chunks and final usage), the provider-registration regression above, `ApiKeyGenerator`,
   `LocalDevSecretStore` (round-trip + cross-instance decryption using `EphemeralDataProtectionProvider`), and
   `JwtAccessTokenValidator`/`LocalDevTokenIssuer` (valid/expired/wrong-key/wrong-audience/wrong-issuer/malformed
-  tokens, all in `"StaticKey"` mode — no network calls, no real IdP needed).
+  tokens, all in `"StaticKey"` mode — no network calls, no real IdP needed), and `TokenRateLimiter` (against
+  `InMemoryRateLimitStore` + a hand-rolled `ManualTimeProvider` test double — deterministic control over
+  elapsed-window fraction, including the exact-boundary and decay-mid-window cases, without any real waiting).
 - `src/Api.Tests/` — `ChatCompletionsEndpointTests.cs`, a `WebApplicationFactory<Program>` integration test.
   Swaps in the EF Core InMemory provider for `GatewayDbContext` (see the `RemoveAll<DbContextOptions<...>>` +
   `RemoveAll<IDbContextOptionsConfiguration<...>>` + re-`AddDbContext` pattern — both removals are needed, or
@@ -178,7 +221,13 @@ nullable reference types and implicit usings enabled.
   streaming (the stub `IProviderClient.StreamChatCompletionAsync` writes a canned SSE body via the real
   `IStreamResponseWriter` contract, plus a case exercising the "provider rejects before streaming" path through
   the actual `Results.Stream`/`HttpResponse` pipeline — not just a fake, since that's exactly where the tricky
-  "can we still change status code from inside the stream callback" assumption lives).
+  "can we still change status code from inside the stream callback" assumption lives), and rate limiting
+  (overrides `IRateLimitStore` with `InMemoryRateLimitStore` to avoid a real Redis dependency in tests — tenant
+  quota blocking, api-key quota blocking with room left on the tenant, no-quota-configured passthrough, and JWT
+  auth not being subject to a per-key quota). Tests that reach into `GatewayDbContext` directly outside of an
+  HTTP request (e.g. to set a quota mid-test) need `.IgnoreQueryFilters()` on `ApiKeys` queries — there's no
+  ambient `TenantScope` in a bare `CreateScope()`, so the fail-closed default (`Blocked`) hides everything,
+  same underlying mechanism as the `Tenancy` bullet above, just easy to trip over again in a new spot.
   `Program.cs` has `public partial class Program;` at the bottom specifically to make it accessible to
   `WebApplicationFactory<Program>` — keep that if you touch `Program.cs`.
 - `src/Management.Tests/` — `ManagementApiFactory` (shared `WebApplicationFactory<Program>`, same InMemory-DB
@@ -231,14 +280,15 @@ npm run dev       # local dev server
 npm run build     # production build (tsc -b && vite build)
 ```
 
-### Local Postgres + EF Core migrations
+### Local Postgres + Redis + EF Core migrations
 
-`docker-compose.yml` (repo root) runs a local Postgres for development, matching the connection string in
-`src/Api/appsettings.Development.json` and `src/Management/appsettings.Development.json`
-(`Host=localhost;Port=5432;Database=ai_gateway;Username=ai_gateway;Password=ai_gateway` — dev-only credentials).
+`docker-compose.yml` (repo root) runs local Postgres and Redis for development, matching
+`src/Api/appsettings.Development.json` / `src/Management/appsettings.Development.json`
+(Postgres: `Host=localhost;Port=5432;Database=ai_gateway;Username=ai_gateway;Password=ai_gateway`; Redis:
+`localhost:6379` — dev-only credentials, no auth on the local Redis).
 
 ```bash
-docker compose up -d          # start local Postgres (from repo root)
+docker compose up -d          # start local Postgres + Redis (from repo root)
 
 # EF Core tooling (dotnet-ef is a local tool — see .config/dotnet-tools.json; run `dotnet tool restore` once)
 dotnet ef migrations add <Name> --project src/Core --startup-project src/Core --output-dir Persistence/Migrations
@@ -247,6 +297,10 @@ dotnet ef database update --project src/Core --startup-project src/Core
 
 `GatewayDbContextFactory` (used by the `dotnet ef` commands above) reads the connection string from the
 `GATEWAY_DB_CONNECTION_STRING` env var, falling back to the same local dev default if unset.
+
+To inspect rate-limit counters directly: `docker exec ai-gateway-redis-1 redis-cli KEYS 'ratelimit:*'` (keys are
+`ratelimit:tenant:{tenantId:N}:{windowIndex}` / `ratelimit:apikey:{apiKeyId:N}:{windowIndex}`, see
+`RateLimitGate`/`TokenRateLimiter`).
 
 CI (`.github/workflows/ci.yml`) runs `dotnet build`/`dotnet test` on the solution and `npm run build` on the
 Dashboard for every PR. It does not currently run against a real Postgres instance or apply migrations — that's

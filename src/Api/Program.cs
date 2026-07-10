@@ -1,7 +1,9 @@
 using Api.Endpoints;
+using Api.RateLimiting;
 using Core.Auth;
 using Core.Persistence;
 using Core.Providers;
+using Core.RateLimiting;
 using Core.Secrets;
 using Core.Security;
 
@@ -14,6 +16,8 @@ builder.Services.AddProviderClients(builder.Configuration);
 builder.Services.AddGatewaySecrets(builder.Configuration);
 builder.Services.AddApiKeyAuthentication();
 builder.Services.AddManagedIdentityAuthentication(builder.Configuration);
+builder.Services.AddGatewayRateLimiting(builder.Configuration);
+builder.Services.AddScoped<RateLimitGate>();
 
 var app = builder.Build();
 

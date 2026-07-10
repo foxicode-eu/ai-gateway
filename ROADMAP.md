@@ -148,9 +148,25 @@ nonexistent tenant is rejected with `401`.
   first write — confirmed yes, live and in tests)
 
 ## Phase 6 — Rate limiting
-- [ ] Redis-backed sliding-window counters
-- [ ] Enforcement per tenant and per API key
-- [ ] Quota check before proxying, usage recorded after response/stream completes
+- [x] Redis-backed sliding-window counters (`Core/RateLimiting/TokenRateLimiter` — the standard weighted
+  current+previous-fixed-window approximation, O(1) store ops; `RedisRateLimitStore` production /
+  `InMemoryRateLimitStore` local-dev-and-tests, same provider-swap pattern as `Secrets`)
+- [x] Enforcement per tenant and per API key (`Tenant.TokenQuotaPerWindow` / `ApiKey.TokenQuotaPerWindow`, both
+  nullable = unlimited, settable at creation and via new `Management` `PATCH` endpoints; JWT-authenticated
+  requests are tenant-only since that credential model has no notion of "which key")
+- [x] Quota check before proxying, usage recorded after response/stream completes (`Api/RateLimiting/RateLimitGate`)
+- [x] Test coverage: 19 new tests (102 total) — `TokenRateLimiter` algorithm correctness (deterministic fake
+  clock, including exact-boundary and mid-window-decay cases), full `Api.Tests` integration coverage of the
+  blocking/passthrough/per-key-vs-per-tenant/JWT-exemption behavior, and `Management.Tests` coverage of the new
+  quota fields and `PATCH` endpoints
+- [x] Verified live against **real Redis** (not just the in-memory test double, which is all the automated
+  suite exercises) — added `redis:7-alpine` to `docker-compose.yml`. Booted `Api` against it, manually seeded a
+  Redis counter key in the exact format `TokenRateLimiter` uses, past a tenant's configured quota, and confirmed
+  a live request was correctly blocked with `429`; confirmed a tenant with no quota configured is not blocked
+  and reaches the real provider host. Full record→check consumption tracking is covered in `Api.Tests` against
+  `InMemoryRateLimitStore` only — doing the same live wasn't practical without a real provider API key, since a
+  failed provider call (the only kind possible with the fake keys available here) never produces token usage to
+  record in the first place.
 
 ## Phase 7 — Observability & usage data
 - [ ] OpenTelemetry instrumentation (traces + metrics), OTLP export

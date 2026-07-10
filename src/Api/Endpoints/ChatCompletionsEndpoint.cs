@@ -1,8 +1,8 @@
 using System.Text.Json.Nodes;
 using Api.Authentication;
+using Api.RateLimiting;
 using Core.Providers;
 using Core.Secrets;
-using Core.Tenancy;
 using Microsoft.Extensions.DependencyInjection;
 
 namespace Api.Endpoints;
@@ -45,9 +45,20 @@ public static class ChatCompletionsEndpoint
             && streamValue.TryGetValue<bool>(out var isStream)
             && isStream;
 
-        // The auth filter set the tenant scope before this handler ran; it's guaranteed to be a single tenant.
+        // The auth filter set this before this handler ran.
+        var authenticated = (AuthenticatedTenant)httpRequest.HttpContext.Items[nameof(AuthenticatedTenant)]!;
+        var tenantId = authenticated.TenantId;
+
         var services = httpRequest.HttpContext.RequestServices;
-        var tenantId = services.GetRequiredService<ICurrentTenantAccessor>().Scope.TenantId!.Value;
+
+        var rateLimitGate = services.GetRequiredService<RateLimitGate>();
+        var rateLimitCheck = await rateLimitGate.CheckAsync(tenantId, authenticated.ApiKeyId, cancellationToken);
+        if (!rateLimitCheck.IsAllowed)
+        {
+            return Results.Json(
+                new { error = new { message = $"Token rate limit exceeded for this {rateLimitCheck.BlockedScope}." } },
+                statusCode: StatusCodes.Status429TooManyRequests);
+        }
 
         var providerName = ProviderRouting.ResolveProviderName(model);
         var secretStore = services.GetRequiredService<ISecretStore>();
@@ -80,6 +91,10 @@ public static class ChatCompletionsEndpoint
                         logger.LogInformation(
                             "Streamed chat completion finished for tenant {TenantId} via {Provider}: {PromptTokens} prompt + {CompletionTokens} completion tokens",
                             tenantId, providerName, usage.PromptTokens, usage.CompletionTokens);
+
+                        await rateLimitGate.RecordUsageAsync(
+                            tenantId, authenticated.ApiKeyId, rateLimitCheck,
+                            usage.PromptTokens + usage.CompletionTokens, cancellationToken);
                     }
                 },
                 contentType: "text/event-stream");
@@ -87,7 +102,22 @@ public static class ChatCompletionsEndpoint
 
         var providerResponse = await providerClient.CreateChatCompletionAsync(requestBody, providerApiKey, cancellationToken);
 
+        var totalTokens = ExtractTotalTokens(providerResponse.Body);
+        await rateLimitGate.RecordUsageAsync(tenantId, authenticated.ApiKeyId, rateLimitCheck, totalTokens, cancellationToken);
+
         return Results.Json(providerResponse.Body, statusCode: providerResponse.StatusCode);
+    }
+
+    private static int ExtractTotalTokens(JsonObject? body)
+    {
+        if (body?["usage"] is not JsonObject usage)
+        {
+            return 0;
+        }
+
+        var promptTokens = usage["prompt_tokens"]?.GetValue<int>() ?? 0;
+        var completionTokens = usage["completion_tokens"]?.GetValue<int>() ?? 0;
+        return promptTokens + completionTokens;
     }
 
     /// <summary>

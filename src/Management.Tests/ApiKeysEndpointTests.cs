@@ -86,4 +86,47 @@ public class ApiKeysEndpointTests : IClassFixture<ManagementApiFactory>
 
         Assert.Equal(HttpStatusCode.NotFound, revokeResponse.StatusCode);
     }
+
+    [Fact]
+    public async Task Issues_a_key_with_a_token_quota()
+    {
+        var tenantId = await CreateTenantAsync("Acme");
+
+        var response = await _client.PostAsJsonAsync(
+            $"/tenants/{tenantId}/api-keys", new ApiKeysEndpoint.CreateApiKeyRequest("prod-backend", TokenQuotaPerWindow: 1000));
+
+        var body = await response.Content.ReadFromJsonAsync<JsonObject>();
+        Assert.Equal(1000, body?["tokenQuotaPerWindow"]?.GetValue<int>());
+    }
+
+    [Fact]
+    public async Task Updates_a_keys_quota()
+    {
+        var tenantId = await CreateTenantAsync("Acme");
+        var createResponse = await _client.PostAsJsonAsync(
+            $"/tenants/{tenantId}/api-keys", new ApiKeysEndpoint.CreateApiKeyRequest("prod-backend"));
+        var apiKeyId = (await createResponse.Content.ReadFromJsonAsync<JsonObject>())!["id"]!.GetValue<Guid>();
+
+        var patchResponse = await _client.PatchAsJsonAsync(
+            $"/tenants/{tenantId}/api-keys/{apiKeyId}", new ApiKeysEndpoint.UpdateApiKeyRequest(750));
+
+        Assert.Equal(HttpStatusCode.OK, patchResponse.StatusCode);
+        var updated = await patchResponse.Content.ReadFromJsonAsync<JsonObject>();
+        Assert.Equal(750, updated?["tokenQuotaPerWindow"]?.GetValue<int>());
+    }
+
+    [Fact]
+    public async Task Returns_404_when_updating_a_key_that_does_not_belong_to_the_tenant()
+    {
+        var tenantAId = await CreateTenantAsync("Tenant A");
+        var tenantBId = await CreateTenantAsync("Tenant B");
+        var createResponse = await _client.PostAsJsonAsync(
+            $"/tenants/{tenantAId}/api-keys", new ApiKeysEndpoint.CreateApiKeyRequest("prod-backend"));
+        var apiKeyId = (await createResponse.Content.ReadFromJsonAsync<JsonObject>())!["id"]!.GetValue<Guid>();
+
+        var patchResponse = await _client.PatchAsJsonAsync(
+            $"/tenants/{tenantBId}/api-keys/{apiKeyId}", new ApiKeysEndpoint.UpdateApiKeyRequest(750));
+
+        Assert.Equal(HttpStatusCode.NotFound, patchResponse.StatusCode);
+    }
 }

@@ -59,4 +59,59 @@ public class TenantsEndpointTests : IClassFixture<ManagementApiFactory>
 
         Assert.Equal(HttpStatusCode.Unauthorized, response.StatusCode);
     }
+
+    [Fact]
+    public async Task Creates_a_tenant_with_a_token_quota()
+    {
+        var response = await _client.PostAsJsonAsync("/tenants", new TenantsEndpoint.CreateTenantRequest("Acme", TokenQuotaPerWindow: 5000));
+
+        var body = await response.Content.ReadFromJsonAsync<JsonObject>();
+        Assert.Equal(5000, body?["tokenQuotaPerWindow"]?.GetValue<int>());
+    }
+
+    [Fact]
+    public async Task Rejects_a_negative_quota_on_create()
+    {
+        var response = await _client.PostAsJsonAsync("/tenants", new TenantsEndpoint.CreateTenantRequest("Acme", TokenQuotaPerWindow: -1));
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task Updates_a_tenants_quota()
+    {
+        var createResponse = await _client.PostAsJsonAsync("/tenants", new TenantsEndpoint.CreateTenantRequest("Acme"));
+        var tenantId = (await createResponse.Content.ReadFromJsonAsync<JsonObject>())!["id"]!.GetValue<Guid>();
+
+        var patchResponse = await _client.PatchAsJsonAsync($"/tenants/{tenantId}", new TenantsEndpoint.UpdateTenantRequest(2500));
+
+        Assert.Equal(HttpStatusCode.OK, patchResponse.StatusCode);
+        var updated = await patchResponse.Content.ReadFromJsonAsync<JsonObject>();
+        Assert.Equal(2500, updated?["tokenQuotaPerWindow"]?.GetValue<int>());
+
+        var getResponse = await _client.GetAsync($"/tenants/{tenantId}");
+        var fetched = await getResponse.Content.ReadFromJsonAsync<JsonObject>();
+        Assert.Equal(2500, fetched?["tokenQuotaPerWindow"]?.GetValue<int>());
+    }
+
+    [Fact]
+    public async Task Can_clear_a_tenants_quota_back_to_unlimited()
+    {
+        var createResponse = await _client.PostAsJsonAsync(
+            "/tenants", new TenantsEndpoint.CreateTenantRequest("Acme", TokenQuotaPerWindow: 5000));
+        var tenantId = (await createResponse.Content.ReadFromJsonAsync<JsonObject>())!["id"]!.GetValue<Guid>();
+
+        var patchResponse = await _client.PatchAsJsonAsync($"/tenants/{tenantId}", new TenantsEndpoint.UpdateTenantRequest(null));
+
+        var updated = await patchResponse.Content.ReadFromJsonAsync<JsonObject>();
+        Assert.Null(updated?["tokenQuotaPerWindow"]);
+    }
+
+    [Fact]
+    public async Task Returns_404_when_updating_an_unknown_tenant()
+    {
+        var response = await _client.PatchAsJsonAsync($"/tenants/{Guid.NewGuid()}", new TenantsEndpoint.UpdateTenantRequest(1000));
+
+        Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
+    }
 }

@@ -11,10 +11,13 @@ public static class ApiKeysEndpoint
     {
         tenantsGroup.MapPost("/{tenantId:guid}/api-keys", CreateAsync);
         tenantsGroup.MapDelete("/{tenantId:guid}/api-keys/{apiKeyId:guid}", RevokeAsync);
+        tenantsGroup.MapPatch("/{tenantId:guid}/api-keys/{apiKeyId:guid}", UpdateAsync);
         return tenantsGroup;
     }
 
-    public sealed record CreateApiKeyRequest(string Name);
+    public sealed record CreateApiKeyRequest(string Name, int? TokenQuotaPerWindow = null);
+
+    public sealed record UpdateApiKeyRequest(int? TokenQuotaPerWindow);
 
     private static async Task<IResult> CreateAsync(
         Guid tenantId, CreateApiKeyRequest request, GatewayDbContext dbContext, CancellationToken cancellationToken)
@@ -22,6 +25,11 @@ public static class ApiKeysEndpoint
         if (string.IsNullOrWhiteSpace(request.Name))
         {
             return Results.BadRequest(new { error = new { message = "API key name is required." } });
+        }
+
+        if (request.TokenQuotaPerWindow is < 0)
+        {
+            return Results.BadRequest(new { error = new { message = "tokenQuotaPerWindow must be non-negative." } });
         }
 
         var tenantExists = await dbContext.Tenants.AnyAsync(t => t.Id == tenantId, cancellationToken);
@@ -39,13 +47,21 @@ public static class ApiKeysEndpoint
             Name = request.Name,
             KeyHash = ApiKeyGenerator.Hash(plaintextKey),
             CreatedAtUtc = DateTimeOffset.UtcNow,
+            TokenQuotaPerWindow = request.TokenQuotaPerWindow,
         };
         dbContext.ApiKeys.Add(apiKey);
         await dbContext.SaveChangesAsync(cancellationToken);
 
         return Results.Created(
             $"/tenants/{tenantId}/api-keys/{apiKey.Id}",
-            new { id = apiKey.Id, name = apiKey.Name, key = plaintextKey, createdAtUtc = apiKey.CreatedAtUtc });
+            new
+            {
+                id = apiKey.Id,
+                name = apiKey.Name,
+                key = plaintextKey,
+                createdAtUtc = apiKey.CreatedAtUtc,
+                tokenQuotaPerWindow = apiKey.TokenQuotaPerWindow,
+            });
     }
 
     private static async Task<IResult> RevokeAsync(
@@ -63,5 +79,32 @@ public static class ApiKeysEndpoint
         await dbContext.SaveChangesAsync(cancellationToken);
 
         return Results.NoContent();
+    }
+
+    private static async Task<IResult> UpdateAsync(
+        Guid tenantId, Guid apiKeyId, UpdateApiKeyRequest request, GatewayDbContext dbContext, CancellationToken cancellationToken)
+    {
+        if (request.TokenQuotaPerWindow is < 0)
+        {
+            return Results.BadRequest(new { error = new { message = "tokenQuotaPerWindow must be non-negative." } });
+        }
+
+        var apiKey = await dbContext.ApiKeys
+            .FirstOrDefaultAsync(k => k.Id == apiKeyId && k.TenantId == tenantId, cancellationToken);
+
+        if (apiKey is null)
+        {
+            return Results.NotFound();
+        }
+
+        apiKey.TokenQuotaPerWindow = request.TokenQuotaPerWindow;
+        await dbContext.SaveChangesAsync(cancellationToken);
+
+        return Results.Ok(new
+        {
+            id = apiKey.Id,
+            name = apiKey.Name,
+            tokenQuotaPerWindow = apiKey.TokenQuotaPerWindow,
+        });
     }
 }

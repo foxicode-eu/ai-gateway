@@ -9,6 +9,7 @@ using Core.Entities;
 using Core.Persistence;
 using Microsoft.EntityFrameworkCore.Infrastructure;
 using Core.Providers;
+using Core.RateLimiting;
 using Core.Secrets;
 using Core.Security;
 using Microsoft.AspNetCore.Mvc.Testing;
@@ -115,6 +116,9 @@ public class ChatCompletionsEndpointTests : IClassFixture<WebApplicationFactory<
 
                 services.RemoveAll<ISecretStore>();
                 services.AddSingleton<ISecretStore>(_stubSecretStore);
+
+                services.RemoveAll<IRateLimitStore>();
+                services.AddSingleton<IRateLimitStore, InMemoryRateLimitStore>();
 
                 var authOptions = _authenticationOptions;
                 services.Configure<AuthenticationOptions>(o =>
@@ -341,5 +345,104 @@ public class ChatCompletionsEndpointTests : IClassFixture<WebApplicationFactory<
             new StringContent("""{"model":"gpt-4o-mini"}""", Encoding.UTF8, "application/json"));
 
         Assert.Equal(HttpStatusCode.Unauthorized, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task Blocks_requests_once_the_tenants_token_quota_is_exceeded()
+    {
+        using (var scope = _factory.Services.CreateScope())
+        {
+            var dbContext = scope.ServiceProvider.GetRequiredService<GatewayDbContext>();
+            var tenant = await dbContext.Tenants.FirstAsync(t => t.Id == _tenantId);
+            tenant.TokenQuotaPerWindow = 10;
+            await dbContext.SaveChangesAsync();
+        }
+
+        _stubOpenAiClient.Response = new ProviderResponse(200, new JsonObject
+        {
+            ["id"] = "resp-1",
+            ["usage"] = new JsonObject { ["prompt_tokens"] = 6, ["completion_tokens"] = 6 },
+        });
+        var client = CreateAuthenticatedClient();
+
+        var first = await client.PostAsync(
+            "/v1/chat/completions", new StringContent("""{"model":"gpt-4o-mini"}""", Encoding.UTF8, "application/json"));
+        var second = await client.PostAsync(
+            "/v1/chat/completions", new StringContent("""{"model":"gpt-4o-mini"}""", Encoding.UTF8, "application/json"));
+
+        Assert.Equal(HttpStatusCode.OK, first.StatusCode);
+        Assert.Equal((HttpStatusCode)429, second.StatusCode);
+    }
+
+    [Fact]
+    public async Task Does_not_rate_limit_a_tenant_with_no_configured_quota()
+    {
+        _stubOpenAiClient.Response = new ProviderResponse(200, new JsonObject
+        {
+            ["id"] = "resp-1",
+            ["usage"] = new JsonObject { ["prompt_tokens"] = 1_000_000, ["completion_tokens"] = 1_000_000 },
+        });
+        var client = CreateAuthenticatedClient();
+
+        var first = await client.PostAsync(
+            "/v1/chat/completions", new StringContent("""{"model":"gpt-4o-mini"}""", Encoding.UTF8, "application/json"));
+        var second = await client.PostAsync(
+            "/v1/chat/completions", new StringContent("""{"model":"gpt-4o-mini"}""", Encoding.UTF8, "application/json"));
+
+        Assert.Equal(HttpStatusCode.OK, first.StatusCode);
+        Assert.Equal(HttpStatusCode.OK, second.StatusCode);
+    }
+
+    [Fact]
+    public async Task Blocks_requests_once_the_api_keys_own_quota_is_exceeded_even_with_room_left_on_the_tenant()
+    {
+        using (var scope = _factory.Services.CreateScope())
+        {
+            var dbContext = scope.ServiceProvider.GetRequiredService<GatewayDbContext>();
+            var apiKey = await dbContext.ApiKeys.IgnoreQueryFilters().FirstAsync(k => k.TenantId == _tenantId);
+            apiKey.TokenQuotaPerWindow = 10;
+            var tenant = await dbContext.Tenants.FirstAsync(t => t.Id == _tenantId);
+            tenant.TokenQuotaPerWindow = 1_000_000; // plenty of room at the tenant level
+            await dbContext.SaveChangesAsync();
+        }
+
+        _stubOpenAiClient.Response = new ProviderResponse(200, new JsonObject
+        {
+            ["id"] = "resp-1",
+            ["usage"] = new JsonObject { ["prompt_tokens"] = 6, ["completion_tokens"] = 6 },
+        });
+        var client = CreateAuthenticatedClient();
+
+        var first = await client.PostAsync(
+            "/v1/chat/completions", new StringContent("""{"model":"gpt-4o-mini"}""", Encoding.UTF8, "application/json"));
+        var second = await client.PostAsync(
+            "/v1/chat/completions", new StringContent("""{"model":"gpt-4o-mini"}""", Encoding.UTF8, "application/json"));
+
+        Assert.Equal(HttpStatusCode.OK, first.StatusCode);
+        Assert.Equal((HttpStatusCode)429, second.StatusCode);
+    }
+
+    [Fact]
+    public async Task A_jwt_authenticated_request_is_not_subject_to_a_per_api_key_quota()
+    {
+        using (var scope = _factory.Services.CreateScope())
+        {
+            var dbContext = scope.ServiceProvider.GetRequiredService<GatewayDbContext>();
+            var apiKey = await dbContext.ApiKeys.IgnoreQueryFilters().FirstAsync(k => k.TenantId == _tenantId);
+            apiKey.TokenQuotaPerWindow = 1; // tiny — would block the legacy-key path immediately
+            await dbContext.SaveChangesAsync();
+        }
+
+        _stubOpenAiClient.Response = new ProviderResponse(200, new JsonObject
+        {
+            ["id"] = "resp-1",
+            ["usage"] = new JsonObject { ["prompt_tokens"] = 100, ["completion_tokens"] = 100 },
+        });
+        var client = CreateJwtAuthenticatedClient(_tenantId);
+
+        var response = await client.PostAsync(
+            "/v1/chat/completions", new StringContent("""{"model":"gpt-4o-mini"}""", Encoding.UTF8, "application/json"));
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
     }
 }

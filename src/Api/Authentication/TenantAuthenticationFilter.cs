@@ -45,16 +45,17 @@ public sealed class TenantAuthenticationFilter(
             return Unauthorized("Missing or malformed Authorization header.");
         }
 
-        var tenantId = LooksLikeJwt(credential)
+        var authenticated = LooksLikeJwt(credential)
             ? await AuthenticateJwtAsync(credential, httpContext.RequestAborted)
             : await AuthenticateApiKeyAsync(credential, httpContext.RequestAborted);
 
-        if (tenantId is null)
+        if (authenticated is null)
         {
             return Unauthorized("Invalid, expired, or revoked credential.");
         }
 
-        tenantAccessor.SetScope(TenantScope.ForTenant(tenantId.Value));
+        tenantAccessor.SetScope(TenantScope.ForTenant(authenticated.TenantId));
+        httpContext.Items[nameof(AuthenticatedTenant)] = authenticated;
 
         return await next(context);
     }
@@ -63,7 +64,7 @@ public sealed class TenantAuthenticationFilter(
     // never contain a '.'. Cheap and sufficient to route between the two credential shapes.
     private static bool LooksLikeJwt(string credential) => credential.Count(c => c == '.') == 2;
 
-    private async Task<Guid?> AuthenticateJwtAsync(string token, CancellationToken cancellationToken)
+    private async Task<AuthenticatedTenant?> AuthenticateJwtAsync(string token, CancellationToken cancellationToken)
     {
         var principal = await jwtValidator.ValidateAsync(token, cancellationToken);
         var tenantIdClaim = principal?.FindFirst(authenticationOptions.Value.TenantIdClaimType)?.Value;
@@ -76,13 +77,13 @@ public sealed class TenantAuthenticationFilter(
         // Defensive: the IdP isn't yet the source of truth for which tenants exist (no dynamic client
         // registration wired up), so a syntactically valid tenant_id claim isn't automatically trustworthy.
         var tenantExists = await dbContext.Tenants.AnyAsync(t => t.Id == tenantId, cancellationToken);
-        return tenantExists ? tenantId : null;
+        return tenantExists ? new AuthenticatedTenant(tenantId, ApiKeyId: null) : null;
     }
 
-    private async Task<Guid?> AuthenticateApiKeyAsync(string apiKey, CancellationToken cancellationToken)
+    private async Task<AuthenticatedTenant?> AuthenticateApiKeyAsync(string apiKey, CancellationToken cancellationToken)
     {
         var result = await apiKeyAuthenticator.AuthenticateAsync(apiKey, cancellationToken);
-        return result?.TenantId;
+        return result is null ? null : new AuthenticatedTenant(result.TenantId, result.ApiKeyId);
     }
 
     private static IResult Unauthorized(string message) =>

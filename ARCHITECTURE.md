@@ -95,12 +95,25 @@ never expose a token-issuing HTTP endpoint.
 
 ## Rate limiting
 
-- Enforced via Redis-backed sliding-window counters so limits are correct across multiple `Api` instances
-  (required once the gateway scales beyond one replica).
-- Granularity: quotas apply **per tenant and per API key** — a tenant gets an overall quota, and can also set
-  finer-grained limits on individual API keys (e.g. to cap what one app/team within their org can consume).
-- Flow: check remaining quota before proxying a request; after the provider responds (or the stream completes),
-  record actual token usage against both the tenant and API-key counters.
+- Enforced via Redis-backed sliding-window counters (`Core/RateLimiting`) so limits are correct across multiple
+  `Api` instances (required once the gateway scales beyond one replica). The algorithm is the standard
+  weighted-blend "sliding window counter" approximation (two fixed-window counters, current weighted 1.0 and
+  previous weighted by remaining overlap) rather than a full per-event log — O(1) store operations per check,
+  at the cost of assuming usage within a window is spread evenly (it isn't exactly, but this is the accepted
+  practical trade-off). Store is swappable (`RateLimiting:Store` = `"Redis"` production / `"InMemory"` local
+  dev/tests, mirroring the `Secrets` provider pattern) — verified live against real Redis, not just the
+  in-memory test double.
+- Granularity: quotas apply **per tenant and per API key** — a tenant gets an overall quota
+  (`Tenant.TokenQuotaPerWindow`), and can also set a finer-grained limit on individual API keys
+  (`ApiKey.TokenQuotaPerWindow`), both nullable (null = unlimited), settable at creation and updatable via
+  `PATCH` on `Management`. JWT-authenticated data-plane requests (see AuthN/AuthZ) have no notion of "which API
+  key" — that credential model doesn't have one — so they're only subject to the tenant-level quota, not a
+  per-key one.
+- Flow: check remaining quota before proxying a request (an estimate, not a hard admission — actual token count
+  isn't known until the completion finishes, streaming or not); after the provider responds (or the stream
+  completes), record actual token usage against whichever counters (tenant, and API key if present) had a
+  quota configured. A request that never resolves to a provider response (e.g. the provider itself rejects it,
+  no BYOK credential configured) records zero usage — quota is about actual consumption, not attempts.
 
 ## Observability & usage data
 
