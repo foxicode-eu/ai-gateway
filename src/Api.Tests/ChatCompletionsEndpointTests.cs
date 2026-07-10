@@ -1,33 +1,69 @@
 using System.Net;
+using System.Net.Http.Headers;
 using System.Net.Http.Json;
 using System.Text;
 using System.Text.Json.Nodes;
+using Core.Entities;
+using Core.Persistence;
+using Microsoft.EntityFrameworkCore.Infrastructure;
 using Core.Providers;
+using Core.Secrets;
+using Core.Security;
 using Microsoft.AspNetCore.Mvc.Testing;
+using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 using Xunit;
 
 namespace Api.Tests;
 
-public class ChatCompletionsEndpointTests : IClassFixture<WebApplicationFactory<Program>>
+public class ChatCompletionsEndpointTests : IClassFixture<WebApplicationFactory<Program>>, IAsyncLifetime
 {
-    private sealed class StubProviderClient : IProviderClient
+    private sealed class StubProviderClient(string providerName) : IProviderClient
     {
         public JsonObject? LastRequest { get; private set; }
+        public string? LastApiKey { get; private set; }
         public ProviderResponse Response { get; set; } = new(200, new JsonObject { ["id"] = "stub-response" });
 
-        public string ProviderName => "stub";
+        public string ProviderName => providerName;
 
-        public Task<ProviderResponse> CreateChatCompletionAsync(JsonObject request, CancellationToken cancellationToken)
+        public Task<ProviderResponse> CreateChatCompletionAsync(JsonObject request, string apiKey, CancellationToken cancellationToken)
         {
             LastRequest = request;
+            LastApiKey = apiKey;
             return Task.FromResult(Response);
         }
     }
 
+    private sealed class StubSecretStore : ISecretStore
+    {
+        private readonly Dictionary<string, string> _values = [];
+
+        public void Seed(string name, string value) => _values[name] = value;
+
+        public Task SetSecretAsync(string name, string value, CancellationToken cancellationToken)
+        {
+            _values[name] = value;
+            return Task.CompletedTask;
+        }
+
+        public Task<string?> GetSecretAsync(string name, CancellationToken cancellationToken) =>
+            Task.FromResult(_values.TryGetValue(name, out var value) ? value : null);
+
+        public Task DeleteSecretAsync(string name, CancellationToken cancellationToken)
+        {
+            _values.Remove(name);
+            return Task.CompletedTask;
+        }
+    }
+
     private readonly WebApplicationFactory<Program> _factory;
-    private readonly StubProviderClient _stubProviderClient = new();
+    private readonly StubProviderClient _stubOpenAiClient = new("openai");
+    private readonly StubSecretStore _stubSecretStore = new();
+    private readonly string _databaseName = Guid.NewGuid().ToString();
+
+    private Guid _tenantId;
+    private string _apiKey = "";
 
     public ChatCompletionsEndpointTests(WebApplicationFactory<Program> factory)
     {
@@ -35,16 +71,56 @@ public class ChatCompletionsEndpointTests : IClassFixture<WebApplicationFactory<
         {
             builder.ConfigureServices(services =>
             {
+                services.RemoveAll<DbContextOptions<GatewayDbContext>>();
+                services.RemoveAll<IDbContextOptionsConfiguration<GatewayDbContext>>();
+                services.AddDbContext<GatewayDbContext>(options => options.UseInMemoryDatabase(_databaseName));
+
                 services.RemoveAll<IProviderClient>();
-                services.AddSingleton<IProviderClient>(_stubProviderClient);
+                services.AddSingleton<IProviderClient>(_stubOpenAiClient);
+
+                services.RemoveAll<ISecretStore>();
+                services.AddSingleton<ISecretStore>(_stubSecretStore);
             });
         });
     }
 
-    [Fact]
-    public async Task Proxies_a_valid_request_to_the_provider_and_returns_its_response()
+    public async Task InitializeAsync()
+    {
+        using var scope = _factory.Services.CreateScope();
+        var dbContext = scope.ServiceProvider.GetRequiredService<GatewayDbContext>();
+
+        var tenant = new Tenant { Id = Guid.NewGuid(), Name = "Acme", CreatedAtUtc = DateTimeOffset.UtcNow };
+        dbContext.Tenants.Add(tenant);
+        _tenantId = tenant.Id;
+
+        _apiKey = ApiKeyGenerator.GenerateSecret();
+        dbContext.ApiKeys.Add(new ApiKey
+        {
+            Id = Guid.NewGuid(),
+            TenantId = tenant.Id,
+            Name = "test-key",
+            KeyHash = ApiKeyGenerator.Hash(_apiKey),
+            CreatedAtUtc = DateTimeOffset.UtcNow,
+        });
+
+        await dbContext.SaveChangesAsync();
+
+        _stubSecretStore.Seed(ProviderCredentialSecretName.For(_tenantId, "openai"), "sk-tenant-openai-key");
+    }
+
+    public Task DisposeAsync() => Task.CompletedTask;
+
+    private HttpClient CreateAuthenticatedClient()
     {
         var client = _factory.CreateClient();
+        client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", _apiKey);
+        return client;
+    }
+
+    [Fact]
+    public async Task Proxies_a_valid_request_to_the_resolved_providers_credential()
+    {
+        var client = CreateAuthenticatedClient();
 
         var response = await client.PostAsync(
             "/v1/chat/completions",
@@ -53,14 +129,15 @@ public class ChatCompletionsEndpointTests : IClassFixture<WebApplicationFactory<
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
         var body = await response.Content.ReadFromJsonAsync<JsonObject>();
         Assert.Equal("stub-response", body?["id"]?.GetValue<string>());
-        Assert.Equal("gpt-4o-mini", _stubProviderClient.LastRequest?["model"]?.GetValue<string>());
+        Assert.Equal("gpt-4o-mini", _stubOpenAiClient.LastRequest?["model"]?.GetValue<string>());
+        Assert.Equal("sk-tenant-openai-key", _stubOpenAiClient.LastApiKey);
     }
 
     [Fact]
     public async Task Propagates_a_non_200_status_code_from_the_provider()
     {
-        _stubProviderClient.Response = new ProviderResponse(429, new JsonObject { ["error"] = "rate limited" });
-        var client = _factory.CreateClient();
+        _stubOpenAiClient.Response = new ProviderResponse(429, new JsonObject { ["error"] = "rate limited" });
+        var client = CreateAuthenticatedClient();
 
         var response = await client.PostAsync(
             "/v1/chat/completions",
@@ -72,37 +149,74 @@ public class ChatCompletionsEndpointTests : IClassFixture<WebApplicationFactory<
     [Fact]
     public async Task Rejects_requests_missing_the_model_field()
     {
-        var client = _factory.CreateClient();
+        var client = CreateAuthenticatedClient();
 
         var response = await client.PostAsync(
             "/v1/chat/completions",
             new StringContent("""{"messages":[]}""", Encoding.UTF8, "application/json"));
 
         Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
-        Assert.Null(_stubProviderClient.LastRequest);
+        Assert.Null(_stubOpenAiClient.LastRequest);
     }
 
     [Fact]
     public async Task Rejects_streaming_requests_as_not_yet_supported()
     {
-        var client = _factory.CreateClient();
+        var client = CreateAuthenticatedClient();
 
         var response = await client.PostAsync(
             "/v1/chat/completions",
             new StringContent("""{"model":"gpt-4o-mini","stream":true}""", Encoding.UTF8, "application/json"));
 
         Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
-        Assert.Null(_stubProviderClient.LastRequest);
+        Assert.Null(_stubOpenAiClient.LastRequest);
     }
 
     [Fact]
     public async Task Rejects_malformed_json_bodies()
     {
-        var client = _factory.CreateClient();
+        var client = CreateAuthenticatedClient();
 
         var response = await client.PostAsync(
             "/v1/chat/completions",
             new StringContent("not json", Encoding.UTF8, "application/json"));
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task Rejects_requests_without_an_authorization_header()
+    {
+        var client = _factory.CreateClient();
+
+        var response = await client.PostAsync(
+            "/v1/chat/completions",
+            new StringContent("""{"model":"gpt-4o-mini"}""", Encoding.UTF8, "application/json"));
+
+        Assert.Equal(HttpStatusCode.Unauthorized, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task Rejects_requests_with_an_unknown_api_key()
+    {
+        var client = _factory.CreateClient();
+        client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", "sk-gw-does-not-exist");
+
+        var response = await client.PostAsync(
+            "/v1/chat/completions",
+            new StringContent("""{"model":"gpt-4o-mini"}""", Encoding.UTF8, "application/json"));
+
+        Assert.Equal(HttpStatusCode.Unauthorized, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task Rejects_requests_when_the_tenant_has_no_credential_for_the_resolved_provider()
+    {
+        var client = CreateAuthenticatedClient();
+
+        var response = await client.PostAsync(
+            "/v1/chat/completions",
+            new StringContent("""{"model":"claude-3-5-sonnet-20241022"}""", Encoding.UTF8, "application/json"));
 
         Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
     }

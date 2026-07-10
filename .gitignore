@@ -3,6 +3,9 @@ bin/
 obj/
 *.user
 
+# Local dev secrets (see Core/Secrets/LocalDevSecretStore.cs — dev-only, never production)
+/.local/
+
 # Node / Dashboard
 node_modules/
 dist/

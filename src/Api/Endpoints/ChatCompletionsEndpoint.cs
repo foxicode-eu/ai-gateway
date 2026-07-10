@@ -1,5 +1,8 @@
 using System.Text.Json.Nodes;
+using Api.Authentication;
 using Core.Providers;
+using Core.Secrets;
+using Core.Tenancy;
 using Microsoft.Extensions.DependencyInjection;
 
 namespace Api.Endpoints;
@@ -8,7 +11,8 @@ public static class ChatCompletionsEndpoint
 {
     public static IEndpointRouteBuilder MapChatCompletions(this IEndpointRouteBuilder app)
     {
-        app.MapPost("/v1/chat/completions", HandleAsync);
+        app.MapPost("/v1/chat/completions", HandleAsync)
+            .AddEndpointFilter<ApiKeyAuthenticationFilter>();
         return app;
     }
 
@@ -31,7 +35,7 @@ public static class ChatCompletionsEndpoint
             return Results.BadRequest(new { error = new { message = "Request body must be a JSON object." } });
         }
 
-        if (requestBody["model"] is not JsonValue)
+        if (requestBody["model"] is not JsonValue || requestBody["model"]!.GetValue<string>() is not { Length: > 0 } model)
         {
             return Results.BadRequest(new { error = new { message = "Request body must include a 'model' field." } });
         }
@@ -50,10 +54,24 @@ public static class ChatCompletionsEndpoint
                 statusCode: StatusCodes.Status400BadRequest);
         }
 
-        // Resolved lazily (rather than as a bound parameter) so provider misconfiguration only surfaces once
-        // validation has passed and we actually need to call out — not on every request regardless of shape.
-        var providerClient = httpRequest.HttpContext.RequestServices.GetRequiredService<IProviderClient>();
-        var providerResponse = await providerClient.CreateChatCompletionAsync(requestBody, cancellationToken);
+        // The auth filter set the tenant scope before this handler ran; it's guaranteed to be a single tenant.
+        var services = httpRequest.HttpContext.RequestServices;
+        var tenantId = services.GetRequiredService<ICurrentTenantAccessor>().Scope.TenantId!.Value;
+
+        var providerName = ProviderRouting.ResolveProviderName(model);
+        var secretStore = services.GetRequiredService<ISecretStore>();
+        var providerApiKey = await secretStore.GetSecretAsync(
+            ProviderCredentialSecretName.For(tenantId, providerName), cancellationToken);
+
+        if (providerApiKey is null)
+        {
+            return Results.Json(
+                new { error = new { message = $"No '{providerName}' credential configured for this tenant." } },
+                statusCode: StatusCodes.Status400BadRequest);
+        }
+
+        var providerClient = services.GetRequiredService<IProviderClientRegistry>().Get(providerName);
+        var providerResponse = await providerClient.CreateChatCompletionAsync(requestBody, providerApiKey, cancellationToken);
 
         return Results.Json(providerResponse.Body, statusCode: providerResponse.StatusCode);
     }

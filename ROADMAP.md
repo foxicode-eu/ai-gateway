@@ -51,10 +51,49 @@ first (missing `model`, malformed JSON, `stream:true`). Fixed by resolving `IPro
 parameters that can throw during construction/configuration.
 
 ## Phase 3 — Multi-tenancy + BYOK credentials
-- [ ] `Management` API: tenant CRUD, API key issuance
-- [ ] Provider credential storage via Azure Key Vault, looked up per tenant
-- [ ] `Api` resolves tenant + provider key from the incoming API key rather than dev config
-- [ ] Anthropic provider client added alongside OpenAI
+- [x] `Management` API: tenant CRUD (`POST`/`GET /tenants`), API key issuance/revocation
+  (`POST`/`DELETE /tenants/{id}/api-keys`), provider credential storage (`PUT /tenants/{id}/providers/{name}`)
+- [x] Provider credential storage via `ISecretStore`: `AzureKeyVaultSecretStore` (production path, not yet
+  exercised against a real vault) and `LocalDevSecretStore` (dev-only, Data-Protection-encrypted file — see
+  `CLAUDE.md`), selected by `Secrets:Provider` config
+- [x] `Api` resolves tenant from the incoming API key (`ApiKeyAuthenticationFilter` → `IApiKeyAuthenticator`,
+  hash-lookup with `IgnoreQueryFilters()`) and looks up that tenant's BYOK provider credential rather than using
+  dev config
+- [x] Anthropic provider client added alongside OpenAI, with request/response translation
+  (`AnthropicChatTranslator`) so both are reachable through the same OpenAI-shaped public endpoint
+- [x] Provider selection: `ProviderRouting` (model-name-prefix heuristic — documented as a stopgap, not final
+  design; see its doc comment and the "Open questions" in `ARCHITECTURE.md`)
+- [x] Test coverage: 51 tests total across the solution — translator unit tests, both provider clients against
+  fake HTTP handlers, tenant query-filter + API-key-auth behavior, `LocalDevSecretStore` round-trip/cross-instance
+  decryption, and full `WebApplicationFactory` integration tests for both `Api`'s chat-completions endpoint and
+  all three `Management` endpoints (EF Core InMemory provider, no real Postgres needed to run the suite)
+- [x] Verified live end-to-end against real Postgres: created a tenant, issued an API key, set both an OpenAI
+  and an Anthropic credential via `Management`, then called `Api`'s `/v1/chat/completions` with the issued key
+  for both a `gpt-*` and a `claude-*` model and confirmed each request reached the *correct* provider host with
+  the *correct* tenant credential (verified via provider-shaped error messages for the intentionally-fake keys)
+
+Two real bugs found and fixed during live verification (not caught by the test suite beforehand — both were
+cross-process/cross-request wiring issues that unit and even most integration tests wouldn't surface):
+
+1. **Cross-process Data Protection key ring mismatch.** `Api` and `Management` are separate processes; ASP.NET
+   Core's default Data Protection setup gives each its own isolated key ring, so a secret `Management` encrypted
+   couldn't be decrypted by `Api` (`CryptographicException` at request time, not at startup). Fixed by
+   explicitly configuring a shared, persisted key ring (fixed application name + a directory on disk) in
+   `AddGatewaySecrets`'s `"LocalDev"` branch.
+2. **`AddHttpClient<IProviderClient, TImpl>` collision across two providers.** Typed-client registration names
+   the underlying named `HttpClient` after `TClient`, not `TImplementation`. Registering both OpenAI's and
+   Anthropic's clients against the shared `IProviderClient` interface meant both `BaseAddress`-configuring
+   delegates applied to the *same* named client, and the one registered last (Anthropic) silently won for both
+   — an OpenAI-routed request was actually being sent to `api.anthropic.com`. Caught because the response body
+   was Anthropic-shaped for a `gpt-4o-mini` request. Fixed by keying each provider's typed client by its own
+   concrete type and bridging to `IProviderClient` separately; regression test added
+   (`Core.Tests/Providers/ServiceCollectionExtensionsTests.cs`).
+
+A third, lower-stakes bug was caught while writing `Management.Tests`: generating the EF Core InMemory database
+name *inside* the `AddDbContext` configure lambda (`UseInMemoryDatabase(Guid.NewGuid().ToString())`) rather than
+capturing it once beforehand meant every re-invocation of that delegate got a fresh, empty database — data
+written in one request "disappeared" for the next. Looked like a 404-after-create logic bug before the cause
+was found; see the `ManagementApiFactory`/`ChatCompletionsEndpointTests` note in `CLAUDE.md`.
 
 ## Phase 4 — AuthN / AuthZ
 - [ ] Managed IdP integration (Entra ID external tenants or Auth0)
