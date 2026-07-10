@@ -83,9 +83,15 @@ never expose a token-issuing HTTP endpoint.
 - **Public API surface**: OpenAI-compatible REST shape. Requests targeting non-OpenAI providers (e.g. Anthropic)
   are translated at the edge in `Api` so tenants can point any OpenAI-SDK-compatible client at the gateway
   regardless of which backend model/provider actually serves the request.
-- **Streaming**: SSE streaming (`stream: true`) is supported end-to-end from the start — proxy the
-  provider's stream chunk-by-chunk rather than buffering, since much of the target client ecosystem expects
-  streaming to work. Token usage for rate-limiting/metrics purposes is finalized once the stream completes.
+- **Streaming**: SSE streaming (`stream: true`) is supported end-to-end — the provider's stream is forwarded
+  chunk-by-chunk, never buffered in full. OpenAI is a byte pass-through (the public contract already matches
+  OpenAI's own SSE shape); Anthropic gets a real, frame-by-frame translation
+  (`Core/Providers/Anthropic/AnthropicStreamTranslator`) since its native Messages API streaming format is
+  unrelated to OpenAI's. Token usage is captured once the stream completes and logged — there's no
+  rate-limiting/metrics consumer for it yet (Phases 6/7 build on this hook, they don't exist yet). If a provider
+  rejects a request before sending any stream data (e.g. bad credentials), the gateway returns a normal
+  non-streaming JSON error with the real status code rather than a 200 SSE stream containing an error — verified
+  live against both real provider hosts with intentionally-invalid keys.
 
 ## Rate limiting
 

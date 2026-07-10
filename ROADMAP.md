@@ -126,8 +126,26 @@ the intentionally-fake key); confirmed the legacy API-key path still works uncha
 nonexistent tenant is rejected with `401`.
 
 ## Phase 5 — Streaming
-- [ ] SSE passthrough (`stream: true`) for both providers
-- [ ] Token usage finalized from completed stream for downstream metrics/rate-limit accounting
+- [x] SSE passthrough (`stream: true`) for both providers — OpenAI is a byte pass-through (public contract
+  already matches OpenAI's SSE shape); Anthropic gets a real frame-by-frame translation
+  (`AnthropicStreamTranslator`, pure/stateful, unit-tested independent of any HTTP mocking)
+- [x] Token usage finalized from completed stream — captured and logged (`ILogger`, no metrics/rate-limit
+  consumer yet; that's Phases 6/7, this just wires the hook)
+- [x] Correctness fix found during design (not live verification this time — caught while implementing, before
+  it ever ran): a provider rejecting a request before sending any stream data (bad credentials, etc.) must not
+  be forwarded as if it were a successful SSE stream. Real providers return a normal non-streaming JSON error
+  with a real status code for this, not a mid-stream event — so the gateway now does the same
+  (`IStreamResponseWriter`, lets a provider client switch the outer response to `application/json` + the real
+  status code, but only works before the first byte is written to the stream body). Verified live against real
+  `api.openai.com` and `api.anthropic.com` with intentionally-invalid keys: both return `401` with
+  `Content-Type: application/json`, and the Anthropic error is correctly translated into the OpenAI-shaped
+  `{"error": {...}}` form.
+- [x] Test coverage: 26 new tests (83 total) — `AnthropicStreamTranslator` pure-logic tests, both provider
+  clients' streaming I/O (canned SSE via `FakeHttpMessageHandler`, including the error-before-streaming path),
+  and `Api.Tests` integration coverage through the real `Results.Stream`/`HttpResponse` pipeline (not just a
+  fake) for both the happy path and the error-switch path, since that's exactly where the trickiest assumption
+  in this phase lives (can response status/content-type still change from inside the stream callback before the
+  first write — confirmed yes, live and in tests)
 
 ## Phase 6 — Rate limiting
 - [ ] Redis-backed sliding-window counters

@@ -121,7 +121,8 @@ public static class AnthropicChatTranslator
         };
     }
 
-    private static string MapStopReason(string? anthropicStopReason) => anthropicStopReason switch
+    /// <summary>Internal so <see cref="AnthropicStreamTranslator"/> can reuse the same mapping.</summary>
+    internal static string MapStopReason(string? anthropicStopReason) => anthropicStopReason switch
     {
         "end_turn" or "stop_sequence" => "stop",
         "max_tokens" => "length",

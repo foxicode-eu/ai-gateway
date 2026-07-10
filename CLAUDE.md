@@ -16,9 +16,9 @@ out of order. Read both before making structural decisions (new projects, auth f
 
 ## Current state
 
-Phases 0–4 are done (solution scaffolding, core domain + persistence, walking-skeleton proxy, multi-tenancy +
-BYOK credentials, JWT/managed-IdP auth) — see `ROADMAP.md` for what's next. There is still no rate limiting and
-no streaming. `Api` accepts both a JWT and a legacy hashed API key (see "AuthN" below — this is a deliberate,
+Phases 0–5 are done (solution scaffolding, core domain + persistence, walking-skeleton proxy, multi-tenancy +
+BYOK credentials, JWT/managed-IdP auth, streaming) — see `ROADMAP.md` for what's next. There is still no rate
+limiting. `Api` accepts both a JWT and a legacy hashed API key (see "AuthN" below — this is a deliberate,
 temporary dual-scheme, not an oversight). Check `ROADMAP.md` before starting new work so you're building the
 current phase, not a later one out of order, and update it as phases complete. Update `ARCHITECTURE.md` too if
 you make a decision that resolves one of its "Open questions".
@@ -37,10 +37,11 @@ nullable reference types and implicit usings enabled.
     (`Authentication/TenantAuthenticationFilter.cs`). The credential is either a JWT (3 dot-separated segments —
     validated via `IJwtAccessTokenValidator`, tenant resolved from its `tenant_id` claim, then checked against
     real tenants in the DB) or a legacy hashed API key (`IApiKeyAuthenticator`, from Phase 3) — see "AuthN" below
-    for why both exist. Once the tenant is resolved, the flow is unchanged from Phase 3: pick a provider from the
-    model name (`Core.Providers.ProviderRouting` — currently a `"claude*" → anthropic, else → openai` heuristic,
-    not real per-tenant config; see its doc comment), look up that tenant's BYOK credential via `ISecretStore`,
-    proxy through `IProviderClientRegistry`. Non-streaming only (`stream:true` returns `400`).
+    for why both exist. Once the tenant is resolved: pick a provider from the model name
+    (`Core.Providers.ProviderRouting` — currently a `"claude*" → anthropic, else → openai` heuristic, not real
+    per-tenant config; see its doc comment), look up that tenant's BYOK credential via `ISecretStore`, then either
+    `CreateChatCompletionAsync` (buffered `Results.Json`) or, if `stream:true`, `StreamChatCompletionAsync` via
+    `Results.Stream(..., contentType: "text/event-stream")` — see "Streaming" below.
 - `src/Management/` — ASP.NET Core Web API (`Microsoft.NET.Sdk.Web`), the control-plane API. References `Core`,
   wired the same way as `Api` (persistence, providers, secrets, `AddManagedIdentityAuthentication` — no
   `AddApiKeyAuthentication`, Management doesn't accept the legacy scheme). Every request runs
@@ -105,10 +106,11 @@ nullable reference types and implicit usings enabled.
   - `Providers/` — `IProviderClient` (request/response passed through as `JsonObject`, not fully typed — see
     the doc comment on the interface for why), `IProviderClientRegistry`/`ProviderClientRegistry` (resolves a
     client by `ProviderName` from all registered `IProviderClient`s), `ProviderRouting` (the model-name-prefix
-    heuristic mentioned above), `OpenAiProviderClient`, and `AddProviderClients`/`AddOpenAiProviderClient`/
-    `AddAnthropicProviderClient` (DI registration). No credential is baked into any client at construction time
-    — `CreateChatCompletionAsync(request, apiKey, cancellationToken)` takes the tenant's BYOK key per call,
-    since one client instance is shared across every tenant using that provider.
+    heuristic mentioned above), `OpenAiProviderClient`, `IStreamResponseWriter` (see "Streaming" below), and
+    `AddProviderClients`/`AddOpenAiProviderClient`/`AddAnthropicProviderClient` (DI registration). No credential
+    is baked into any client at construction time — both `CreateChatCompletionAsync` and
+    `StreamChatCompletionAsync` take the tenant's BYOK key per call, since one client instance is shared across
+    every tenant using that provider.
     **Registration gotcha, already hit once:** each provider's `AddHttpClient<...>()` call must key the typed
     client by its own *concrete* type (`OpenAiProviderClient`, `AnthropicProviderClient`), never by the shared
     `IProviderClient` interface. `AddHttpClient<TClient, TImplementation>` names the underlying named
@@ -121,19 +123,50 @@ nullable reference types and implicit usings enabled.
     `Core.Tests/Providers/ServiceCollectionExtensionsTests.cs`. If you add a third provider, follow the existing
     pattern (own concrete type + a separate `services.AddTransient<IProviderClient>(sp => sp.GetRequiredService<...>())`
     bridge), not the interface-keyed one.
-    - `Providers/Anthropic/` — `AnthropicProviderClient` and `AnthropicChatTranslator` (pure functions
-      translating the gateway's OpenAI-shaped public contract to/from Anthropic's native Messages API — moves
+    - `Providers/Anthropic/` — `AnthropicProviderClient`, `AnthropicChatTranslator` (pure functions translating
+      the gateway's OpenAI-shaped public contract to/from Anthropic's native Messages API, non-streaming — moves
       `system` messages out of the array, defaults `max_tokens` when the caller omits it, maps `stop_reason` to
-      OpenAI's `finish_reason` vocabulary). Known limitations documented on the translator's methods: string
-      message content only (no multimodal), and only text content blocks are read back from the response.
+      OpenAI's `finish_reason` vocabulary), and `AnthropicStreamTranslator` (the streaming counterpart — see
+      "Streaming" below). Known limitations documented on the translator methods: string message content only
+      (no multimodal), and only text content blocks are read back from the response.
+
+### Streaming
+
+`IProviderClient.StreamChatCompletionAsync(request, apiKey, writer, cancellationToken)` writes OpenAI-shaped SSE
+(`data: {...}\n\n`, terminated by `data: [DONE]\n\n`) to `writer.Body` as it arrives — never buffered in full.
+- **OpenAI**: pure byte pass-through (the gateway's public contract already *is* OpenAI's SSE shape) — no
+  per-chunk translation. Forces `stream_options.include_usage: true` on the outgoing request so the final chunk
+  carries usage, which is extracted without a second round trip.
+- **Anthropic**: real translation, one Anthropic SSE frame (`event: ...` + `data: ...`) at a time, via
+  `AnthropicStreamTranslator` (`Core/Providers/Anthropic/`) — pure/stateful, no I/O, so it's unit-tested directly
+  without any HTTP mocking (`Core.Tests/Providers/Anthropic/AnthropicStreamTranslatorTests.cs`). Maps
+  `message_start` → an initial `{"delta":{"role":"assistant"}}` chunk, `content_block_delta` (text only) →
+  content chunks, `message_delta`'s `stop_reason` → a finish-reason chunk, `message_stop` → `[DONE]`. A
+  mid-stream `event: error` has no standard OpenAI streaming equivalent and is currently just dropped — real
+  providers signal request-level failures as a non-streaming error (see next point), not mid-stream, so this
+  hasn't mattered in practice.
+- **`IStreamResponseWriter`** (`Core/Providers/IStreamResponseWriter.cs`) exists so `Core` doesn't need an
+  ASP.NET Core dependency, and — more importantly — so a provider client can switch the *outer* HTTP response
+  to a normal non-streaming JSON error (real status code + `application/json`) if the provider rejects the
+  request (e.g. bad credentials) *before* sending any SSE data, rather than pretending a failed request was a
+  successful 200 stream. This only works because it happens before the first write to `writer.Body` — headers
+  can't change after that. `Api/Endpoints/ChatCompletionsEndpoint.cs` has a private `HttpResponseStreamWriter`
+  adapting `HttpResponse` to this interface, used inside the `Results.Stream(...)` callback. **Verified live**
+  against real `api.openai.com`/`api.anthropic.com` with intentionally-invalid keys: both correctly return the
+  real status code (`401`) with `Content-Type: application/json` (not `text/event-stream`), and the Anthropic
+  error body is correctly translated into the OpenAI-shaped `{"error": {...}}` form.
+- Token usage is logged (`ILogger`, Information level) once a stream completes successfully — there's no
+  metrics/rate-limiting consumer for it yet (Phases 6/7); this just establishes where that hook goes.
 - `src/Dashboard/` — React + TypeScript SPA (Vite), for tenant self-service. Currently the unmodified Vite
   starter template, not wired to any API yet.
-- `src/Core.Tests/` — covers the tenant query-filter behavior, both provider clients (fake `HttpMessageHandler`,
-  no real network calls), the Anthropic translator (pure-function unit tests), the provider-registration
-  regression above, `ApiKeyGenerator`, `LocalDevSecretStore` (round-trip + cross-instance decryption using
-  `EphemeralDataProtectionProvider`), and `JwtAccessTokenValidator`/`LocalDevTokenIssuer` (valid/expired/
-  wrong-key/wrong-audience/wrong-issuer/malformed tokens, all in `"StaticKey"` mode — no network calls, no real
-  IdP needed).
+- `src/Core.Tests/` — covers the tenant query-filter behavior, both provider clients incl. streaming (fake
+  `HttpMessageHandler` + `FakeStreamResponseWriter`, no real network calls — including the error-before-streaming
+  path for both providers), the Anthropic translators, both non-streaming (pure-function tests) and streaming
+  (`AnthropicStreamTranslatorTests` — pure/stateful, feeds a sequence of Anthropic SSE events and asserts the
+  resulting OpenAI-shaped chunks and final usage), the provider-registration regression above, `ApiKeyGenerator`,
+  `LocalDevSecretStore` (round-trip + cross-instance decryption using `EphemeralDataProtectionProvider`), and
+  `JwtAccessTokenValidator`/`LocalDevTokenIssuer` (valid/expired/wrong-key/wrong-audience/wrong-issuer/malformed
+  tokens, all in `"StaticKey"` mode — no network calls, no real IdP needed).
 - `src/Api.Tests/` — `ChatCompletionsEndpointTests.cs`, a `WebApplicationFactory<Program>` integration test.
   Swaps in the EF Core InMemory provider for `GatewayDbContext` (see the `RemoveAll<DbContextOptions<...>>` +
   `RemoveAll<IDbContextOptionsConfiguration<...>>` + re-`AddDbContext` pattern — both removals are needed, or
@@ -141,7 +174,11 @@ nullable reference types and implicit usings enabled.
   `ISecretStore`, and a test-owned `"StaticKey"` `AuthenticationOptions` override (via `services.Configure<AuthenticationOptions>`,
   applied *after* `Program.cs`'s own registration so it wins), and seeds a real tenant + API key through the
   `GatewayDbContext` directly so tests authenticate the same way a real client would — both the legacy API-key
-  path and the JWT path (minted with `LocalDevTokenIssuer` against the test's own options) are covered.
+  path and the JWT path (minted with `LocalDevTokenIssuer` against the test's own options) are covered, as is
+  streaming (the stub `IProviderClient.StreamChatCompletionAsync` writes a canned SSE body via the real
+  `IStreamResponseWriter` contract, plus a case exercising the "provider rejects before streaming" path through
+  the actual `Results.Stream`/`HttpResponse` pipeline — not just a fake, since that's exactly where the tricky
+  "can we still change status code from inside the stream callback" assumption lives).
   `Program.cs` has `public partial class Program;` at the bottom specifically to make it accessible to
   `WebApplicationFactory<Program>` — keep that if you touch `Program.cs`.
 - `src/Management.Tests/` — `ManagementApiFactory` (shared `WebApplicationFactory<Program>`, same InMemory-DB

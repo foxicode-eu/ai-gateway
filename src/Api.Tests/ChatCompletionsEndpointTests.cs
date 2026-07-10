@@ -26,6 +26,9 @@ public class ChatCompletionsEndpointTests : IClassFixture<WebApplicationFactory<
         public JsonObject? LastRequest { get; private set; }
         public string? LastApiKey { get; private set; }
         public ProviderResponse Response { get; set; } = new(200, new JsonObject { ["id"] = "stub-response" });
+        public string StreamedBody { get; set; } = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n";
+        public StreamUsage? StreamedUsage { get; set; } = new(3, 2);
+        public (int StatusCode, string Body)? StreamedError { get; set; }
 
         public string ProviderName => providerName;
 
@@ -34,6 +37,25 @@ public class ChatCompletionsEndpointTests : IClassFixture<WebApplicationFactory<
             LastRequest = request;
             LastApiKey = apiKey;
             return Task.FromResult(Response);
+        }
+
+        public async Task<StreamUsage?> StreamChatCompletionAsync(
+            JsonObject request, string apiKey, IStreamResponseWriter writer, CancellationToken cancellationToken)
+        {
+            LastRequest = request;
+            LastApiKey = apiKey;
+
+            if (StreamedError is { } error)
+            {
+                writer.SetStatusCode(error.StatusCode);
+                writer.SetContentType("application/json");
+                await writer.Body.WriteAsync(Encoding.UTF8.GetBytes(error.Body), cancellationToken);
+                return null;
+            }
+
+            await writer.Body.WriteAsync(Encoding.UTF8.GetBytes(StreamedBody), cancellationToken);
+            await writer.Body.FlushAsync(cancellationToken);
+            return StreamedUsage;
         }
     }
 
@@ -190,7 +212,7 @@ public class ChatCompletionsEndpointTests : IClassFixture<WebApplicationFactory<
     }
 
     [Fact]
-    public async Task Rejects_streaming_requests_as_not_yet_supported()
+    public async Task Streams_the_providers_sse_body_back_with_the_right_content_type()
     {
         var client = CreateAuthenticatedClient();
 
@@ -198,8 +220,40 @@ public class ChatCompletionsEndpointTests : IClassFixture<WebApplicationFactory<
             "/v1/chat/completions",
             new StringContent("""{"model":"gpt-4o-mini","stream":true}""", Encoding.UTF8, "application/json"));
 
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        Assert.Equal("text/event-stream", response.Content.Headers.ContentType?.MediaType);
+        var body = await response.Content.ReadAsStringAsync();
+        Assert.Equal(_stubOpenAiClient.StreamedBody, body);
+        Assert.True(_stubOpenAiClient.LastRequest?["stream"]?.GetValue<bool>());
+        Assert.Equal("sk-tenant-openai-key", _stubOpenAiClient.LastApiKey);
+    }
+
+    [Fact]
+    public async Task Rejects_a_streaming_request_when_the_tenant_has_no_credential_for_the_resolved_provider()
+    {
+        var client = CreateAuthenticatedClient();
+
+        var response = await client.PostAsync(
+            "/v1/chat/completions",
+            new StringContent("""{"model":"claude-3-5-sonnet-20241022","stream":true}""", Encoding.UTF8, "application/json"));
+
         Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
-        Assert.Null(_stubOpenAiClient.LastRequest);
+    }
+
+    [Fact]
+    public async Task Returns_a_json_error_instead_of_sse_when_the_provider_rejects_a_streaming_request()
+    {
+        _stubOpenAiClient.StreamedError = (401, """{"error":{"message":"Incorrect API key provided"}}""");
+        var client = CreateAuthenticatedClient();
+
+        var response = await client.PostAsync(
+            "/v1/chat/completions",
+            new StringContent("""{"model":"gpt-4o-mini","stream":true}""", Encoding.UTF8, "application/json"));
+
+        Assert.Equal(HttpStatusCode.Unauthorized, response.StatusCode);
+        Assert.Equal("application/json", response.Content.Headers.ContentType?.MediaType);
+        var body = await response.Content.ReadFromJsonAsync<JsonObject>();
+        Assert.Equal("Incorrect API key provided", body?["error"]?["message"]?.GetValue<string>());
     }
 
     [Fact]
