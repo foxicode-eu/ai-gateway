@@ -48,6 +48,27 @@ if a specific enterprise/compliance customer requires it — don't build that is
 - **Control-plane (`Management`)**: tenant admin users authenticate via OIDC/SSO through the same IdP; dashboard
   sessions use standard authorization-code + PKCE flow.
 
+**Implementation status**: `Core/Auth` provides a generic, IdP-agnostic JWT bearer validator
+(`IJwtAccessTokenValidator`) driven by `Authentication:Authority`/`Authentication:Audience` config — this works
+against any OIDC-compliant IdP (Entra ID, Auth0, ...) once one is configured, since signing keys are fetched
+from the IdP's own discovery document rather than hardcoded. It's applied to `Management` (any valid token is
+trusted — see the per-tenant-admin gap below) and, on `Api`, is accepted *alongside* the Phase 3 hashed-API-key
+scheme rather than replacing it.
+
+That "alongside" is a deliberate, temporary compromise, not the target design: fully realizing "OAuth2
+client-credentials tokens scoped to a tenant and an API key" requires the gateway to dynamically register an
+OAuth2 client with the external IdP whenever `Management` issues an API key (so the IdP can mint a token
+embedding that tenant's identity) — and that's IdP-specific integration work that needs a real IdP account to
+build and verify against, which isn't available yet. Until that lands, `Api`'s hashed-API-key scheme (Phase 3)
+remains the primary, fully-verified auth path; JWTs are accepted wherever a `tenant_id` claim happens to be
+present (validated against real tenants in the DB), so the code is ready to receive real IdP-issued tokens the
+moment dynamic client registration exists, without another breaking change.
+
+Local development and tests use a "StaticKey" mode (`LocalDevTokenIssuer` in `Core/Auth`, plus the `DevTools`
+CLI project) that mints tokens signed with a locally-configured symmetric key instead of a real IdP — this is
+explicitly test/dev-only and is never how a real credential should be minted; the running gateway processes
+never expose a token-issuing HTTP endpoint.
+
 ## Provider integration
 
 - Initial providers: **Anthropic** (Messages API) and **OpenAI**. Design the provider abstraction
@@ -104,3 +125,11 @@ if a specific enterprise/compliance customer requires it — don't build that is
 - Concrete alerting delivery mechanism (webhook vs. email vs. both) for quota-threshold notifications.
 - When/whether to introduce schema- or database-per-tenant isolation for specific compliance-driven customers.
 - Pooled/gateway-owned provider key support (future reseller tier).
+- Which managed IdP to actually use (Entra ID external tenants vs. Auth0 vs. other) — blocked on having a real
+  account to build/verify dynamic per-tenant client registration against; the JWT *validation* side is IdP-agnostic
+  and already built (see AuthN/AuthZ above), but nothing has exercised real OIDC discovery against a live IdP.
+- Per-tenant admin restriction on `Management`: today any valid JWT is trusted as a superadmin who can operate
+  on every tenant (matches the existing fully-`Unscoped` DB trust model). A real multi-tenant admin story needs
+  the IdP to carry a tenant/org claim for the logged-in admin and `Management` to check it against the tenant
+  being operated on — not built, and deliberately not guessed at without knowing which IdP's claim conventions
+  to design around.

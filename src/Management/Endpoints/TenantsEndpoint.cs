@@ -6,11 +6,11 @@ namespace Management.Endpoints;
 
 public static class TenantsEndpoint
 {
-    public static IEndpointRouteBuilder MapTenants(this IEndpointRouteBuilder app)
+    public static IEndpointRouteBuilder MapTenants(this IEndpointRouteBuilder tenantsGroup)
     {
-        app.MapPost("/tenants", CreateAsync);
-        app.MapGet("/tenants/{tenantId:guid}", GetAsync);
-        return app;
+        tenantsGroup.MapPost("", CreateAsync);
+        tenantsGroup.MapGet("/{tenantId:guid}", GetAsync);
+        return tenantsGroup;
     }
 
     public sealed record CreateTenantRequest(string Name);

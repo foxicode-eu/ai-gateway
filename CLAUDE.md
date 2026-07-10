@@ -16,11 +16,12 @@ out of order. Read both before making structural decisions (new projects, auth f
 
 ## Current state
 
-Phases 0–3 are done (solution scaffolding, core domain + persistence, walking-skeleton proxy, multi-tenancy +
-BYOK credentials) — see `ROADMAP.md` for what's next. There is still no OAuth2/managed-IdP auth (API keys are
-the only auth today), no rate limiting, and no streaming. Check `ROADMAP.md` before starting new work so you're
-building the current phase, not a later one out of order, and update it as phases complete. Update
-`ARCHITECTURE.md` too if you make a decision that resolves one of its "Open questions".
+Phases 0–4 are done (solution scaffolding, core domain + persistence, walking-skeleton proxy, multi-tenancy +
+BYOK credentials, JWT/managed-IdP auth) — see `ROADMAP.md` for what's next. There is still no rate limiting and
+no streaming. `Api` accepts both a JWT and a legacy hashed API key (see "AuthN" below — this is a deliberate,
+temporary dual-scheme, not an oversight). Check `ROADMAP.md` before starting new work so you're building the
+current phase, not a later one out of order, and update it as phases complete. Update `ARCHITECTURE.md` too if
+you make a decision that resolves one of its "Open questions".
 
 ## Solution structure
 
@@ -29,27 +30,48 @@ nullable reference types and implicit usings enabled.
 
 - `src/Api/` — ASP.NET Core Web API (`Microsoft.NET.Sdk.Web`), the data-plane proxy. References `Core`, wired
   up to Postgres via `AddGatewayPersistence`, providers via `AddProviderClients`, secrets via
-  `AddGatewaySecrets`, and `AddApiKeyAuthentication`. Endpoints:
+  `AddGatewaySecrets`, and both `AddApiKeyAuthentication` and `AddManagedIdentityAuthentication`. Endpoints:
   - `GET /.well-known/ai-routing-configuration` — stub, unimplemented.
-  - `POST /v1/chat/completions` (`Endpoints/ChatCompletionsEndpoint.cs`) — requires
-    `Authorization: Bearer <tenant API key>` (enforced by `.AddEndpointFilter<ApiKeyAuthenticationFilter>()` on
-    the route, see `Authentication/ApiKeyAuthenticationFilter.cs`). Resolves the tenant from that key, picks a
-    provider from the model name (`Core.Providers.ProviderRouting` — currently a `"claude*" → anthropic, else →
-    openai` heuristic, not real per-tenant config; see its doc comment), looks up that tenant's BYOK credential
-    for the resolved provider via `ISecretStore`, and proxies through `IProviderClientRegistry`. Non-streaming
-    only (`stream:true` returns `400`).
+  - `POST /v1/chat/completions` (`Endpoints/ChatCompletionsEndpoint.cs`) — requires `Authorization: Bearer
+    <credential>`, enforced by `.AddEndpointFilter<TenantAuthenticationFilter>()`
+    (`Authentication/TenantAuthenticationFilter.cs`). The credential is either a JWT (3 dot-separated segments —
+    validated via `IJwtAccessTokenValidator`, tenant resolved from its `tenant_id` claim, then checked against
+    real tenants in the DB) or a legacy hashed API key (`IApiKeyAuthenticator`, from Phase 3) — see "AuthN" below
+    for why both exist. Once the tenant is resolved, the flow is unchanged from Phase 3: pick a provider from the
+    model name (`Core.Providers.ProviderRouting` — currently a `"claude*" → anthropic, else → openai` heuristic,
+    not real per-tenant config; see its doc comment), look up that tenant's BYOK credential via `ISecretStore`,
+    proxy through `IProviderClientRegistry`. Non-streaming only (`stream:true` returns `400`).
 - `src/Management/` — ASP.NET Core Web API (`Microsoft.NET.Sdk.Web`), the control-plane API. References `Core`,
-  wired the same way as `Api` (persistence, providers, secrets) minus API-key auth. Every request runs
+  wired the same way as `Api` (persistence, providers, secrets, `AddManagedIdentityAuthentication` — no
+  `AddApiKeyAuthentication`, Management doesn't accept the legacy scheme). Every request runs
   `TenantScope.Unscoped` (set by middleware in `Program.cs`) — Management is the trusted control plane and
-  operates across tenants by design; it has no per-request auth yet (that's Phase 4 — OIDC/SSO for admin users).
-  Endpoints (all under `Endpoints/`):
+  operates across tenants by design. All `/tenants/**` routes are grouped (`app.MapGroup("/tenants")` in
+  `Program.cs`) and require a valid JWT via `.AddEndpointFilter<AdminAuthenticationFilter>()`
+  (`Authentication/AdminAuthenticationFilter.cs`) — **any** valid token is trusted as a superadmin able to
+  operate on any tenant; there's no per-tenant admin restriction yet (open item in `ARCHITECTURE.md`). `/healthz`
+  is outside the group and stays unauthenticated. Endpoints (all under `Endpoints/`, registered with paths
+  *relative* to the `/tenants` group — e.g. `""` for the group root, `/{tenantId:guid}` for a specific tenant):
   - `POST /tenants`, `GET /tenants/{tenantId}` — tenant CRUD (create/read only so far).
   - `POST /tenants/{tenantId}/api-keys` — issues a key; the plaintext is only ever in this one response
     (`ApiKeyGenerator.GenerateSecret()`/`.Hash()` in `Core/Security`) — the DB stores only the hash.
   - `DELETE /tenants/{tenantId}/api-keys/{apiKeyId}` — revokes (soft: sets `RevokedAtUtc`).
   - `PUT /tenants/{tenantId}/providers/{providerName}` — stores a tenant's BYOK credential for that provider via
     `ISecretStore`, keyed by `ProviderCredentialSecretName.For(tenantId, providerName)`.
+- `src/DevTools/` — a small console app, **local development only**. `dotnet run --project src/DevTools --
+  mint-token <tenant-id-guid>` mints a JWT signed with the same `Authentication:StaticKey` config `Api`/
+  `Management` use, for manually testing authenticated `curl` requests. Deliberately not an HTTP endpoint on the
+  running gateway — see "AuthN" below for why that matters. Not referenced by `Api`/`Management`/`Dashboard`.
 - `src/Core/` — class library for shared domain code used by both `Api` and `Management`:
+  - `Auth/` — the managed-IdP JWT validation layer: `AuthenticationOptions` (config key `Authentication`,
+    `Mode` = `"OidcAuthority"` for a real IdP via its OIDC discovery document, or `"StaticKey"` for local dev/
+    tests — see below), `IJwtAccessTokenValidator`/`JwtAccessTokenValidator`, `LocalDevTokenIssuer` (mints
+    `"StaticKey"`-signed tokens — throws if `Mode` isn't `"StaticKey"`, refusing to be pointed at a real IdP),
+    and `AddManagedIdentityAuthentication` (DI registration). **The gateway never issues tokens over the wire**
+    — `LocalDevTokenIssuer` is only ever called from tests and the offline `DevTools` CLI, never from an HTTP
+    endpoint in `Api` or `Management`; keep it that way if you touch this area. In `"OidcAuthority"` mode,
+    signing keys come from `{Authority}/.well-known/openid-configuration` via
+    `ConfigurationManager<OpenIdConnectConfiguration>` (cached/auto-refreshed), the same mechanism ASP.NET
+    Core's own JWT bearer handler uses — not hardcoded, not reinvented crypto.
   - `Entities/` — `Tenant`, `ApiKey`.
   - `Persistence/` — `GatewayDbContext` (EF Core + Npgsql), `GatewayDbContextFactory` (design-time factory for
     `dotnet ef` tooling), `ServiceCollectionExtensions.AddGatewayPersistence` (DI registration), and
@@ -108,18 +130,27 @@ nullable reference types and implicit usings enabled.
   starter template, not wired to any API yet.
 - `src/Core.Tests/` — covers the tenant query-filter behavior, both provider clients (fake `HttpMessageHandler`,
   no real network calls), the Anthropic translator (pure-function unit tests), the provider-registration
-  regression above, `ApiKeyGenerator`, and `LocalDevSecretStore` (round-trip + cross-instance decryption using
-  `EphemeralDataProtectionProvider`).
+  regression above, `ApiKeyGenerator`, `LocalDevSecretStore` (round-trip + cross-instance decryption using
+  `EphemeralDataProtectionProvider`), and `JwtAccessTokenValidator`/`LocalDevTokenIssuer` (valid/expired/
+  wrong-key/wrong-audience/wrong-issuer/malformed tokens, all in `"StaticKey"` mode — no network calls, no real
+  IdP needed).
 - `src/Api.Tests/` — `ChatCompletionsEndpointTests.cs`, a `WebApplicationFactory<Program>` integration test.
   Swaps in the EF Core InMemory provider for `GatewayDbContext` (see the `RemoveAll<DbContextOptions<...>>` +
   `RemoveAll<IDbContextOptionsConfiguration<...>>` + re-`AddDbContext` pattern — both removals are needed, or
-  EF Core throws "two database providers registered" at runtime), a stub `IProviderClient`, and a stub
-  `ISecretStore`, and seeds a real tenant + API key through the `GatewayDbContext` directly so tests authenticate
-  the same way a real client would. `Program.cs` has `public partial class Program;` at the bottom specifically
-  to make it accessible to `WebApplicationFactory<Program>` — keep that if you touch `Program.cs`.
+  EF Core throws "two database providers registered" at runtime), a stub `IProviderClient`, a stub
+  `ISecretStore`, and a test-owned `"StaticKey"` `AuthenticationOptions` override (via `services.Configure<AuthenticationOptions>`,
+  applied *after* `Program.cs`'s own registration so it wins), and seeds a real tenant + API key through the
+  `GatewayDbContext` directly so tests authenticate the same way a real client would — both the legacy API-key
+  path and the JWT path (minted with `LocalDevTokenIssuer` against the test's own options) are covered.
+  `Program.cs` has `public partial class Program;` at the bottom specifically to make it accessible to
+  `WebApplicationFactory<Program>` — keep that if you touch `Program.cs`.
 - `src/Management.Tests/` — `ManagementApiFactory` (shared `WebApplicationFactory<Program>`, same InMemory-DB
-  swap pattern as `Api.Tests`, plus an in-memory `ISecretStore`) and endpoint tests per resource
-  (`TenantsEndpointTests`, `ApiKeysEndpointTests`, `ProviderCredentialsEndpointTests`).
+  swap pattern as `Api.Tests`, plus an in-memory `ISecretStore` and its own test-owned `"StaticKey"` auth config)
+  exposes `CreateAuthenticatedClient()` (an `HttpClient` pre-authenticated with a JWT minted via
+  `LocalDevTokenIssuer`) alongside the inherited `CreateClient()` for testing the unauthenticated case. Endpoint
+  tests per resource (`TenantsEndpointTests`, `ApiKeysEndpointTests`, `ProviderCredentialsEndpointTests`) all use
+  the authenticated client; each also has (or `TenantsEndpointTests` has, covering the shared filter) a test
+  asserting `401` without a token.
   **Gotcha already hit once:** generate the InMemory database name *once* (e.g. a field, computed outside the
   `AddDbContext` configure lambda) and reuse it — generating it inline inside the lambda (`UseInMemoryDatabase(Guid.NewGuid().ToString())`)
   means every time EF Core re-invokes that delegate you silently get a fresh, empty database, so data written by
@@ -186,17 +217,26 @@ an open gap, not a deliberate decision; revisit if/when integration tests need a
 
 ### Exercising the tenant onboarding → BYOK → proxy flow locally
 
-With Postgres running (above) and both `Api` and `Management` started:
+With Postgres running (above) and both `Api` and `Management` started, `Management`'s `/tenants/**` routes need
+a valid admin JWT — mint one with `DevTools` (any `tenant_id` claim works here; Management trusts any valid
+token, see "AuthN" above):
 
 ```bash
-# create a tenant, issue an API key, set a provider credential
-curl -X POST http://localhost:5299/tenants -H "Content-Type: application/json" -d '{"name":"Acme"}'
-curl -X POST http://localhost:5299/tenants/<tenantId>/api-keys -H "Content-Type: application/json" -d '{"name":"prod"}'
-curl -X PUT http://localhost:5299/tenants/<tenantId>/providers/openai -H "Content-Type: application/json" -d '{"apiKey":"sk-..."}'
+ADMIN_TOKEN=$(dotnet run --project src/DevTools -- mint-token 00000000-0000-0000-0000-000000000000)
 
-# call the data-plane with the issued key
+# create a tenant, issue an API key, set a provider credential
+curl -X POST http://localhost:5299/tenants -H "Authorization: Bearer $ADMIN_TOKEN" -H "Content-Type: application/json" -d '{"name":"Acme"}'
+curl -X POST http://localhost:5299/tenants/<tenantId>/api-keys -H "Authorization: Bearer $ADMIN_TOKEN" -H "Content-Type: application/json" -d '{"name":"prod"}'
+curl -X PUT http://localhost:5299/tenants/<tenantId>/providers/openai -H "Authorization: Bearer $ADMIN_TOKEN" -H "Content-Type: application/json" -d '{"apiKey":"sk-..."}'
+
+# call the data-plane — either the issued API key, or a JWT scoped to that tenant, both work
 curl -X POST http://localhost:5298/v1/chat/completions \
   -H "Authorization: Bearer <the key from api-keys response>" -H "Content-Type: application/json" \
+  -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}'
+
+DATA_PLANE_TOKEN=$(dotnet run --project src/DevTools -- mint-token <tenantId>)
+curl -X POST http://localhost:5298/v1/chat/completions \
+  -H "Authorization: Bearer $DATA_PLANE_TOKEN" -H "Content-Type: application/json" \
   -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}'
 ```
 
@@ -206,3 +246,7 @@ note above for why the Data Protection key ring configuration there matters. If 
 disagree about a stored credential (`CryptographicException` on `GetSecretAsync`), it usually means
 `.local/secrets.dev.json` predates a change to that key-ring setup; deleting `.local/` and re-onboarding the
 tenant is the fix, not debugging decryption further.
+
+`DevTools` reads `Authentication:*` from `src/Api/appsettings.Development.json` by default (override with
+`--config <path>`) — both `Api` and `Management`'s dev configs share the same `Authentication:StaticKey` value
+so a token minted once works against either.

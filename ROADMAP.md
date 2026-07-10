@@ -96,9 +96,34 @@ written in one request "disappeared" for the next. Looked like a 404-after-creat
 was found; see the `ManagementApiFactory`/`ChatCompletionsEndpointTests` note in `CLAUDE.md`.
 
 ## Phase 4 — AuthN / AuthZ
-- [ ] Managed IdP integration (Entra ID external tenants or Auth0)
-- [ ] `Api`: OAuth2 client-credentials validation on the data-plane
-- [ ] `Management`: OIDC/SSO login for tenant admin users
+- [x] Generic, IdP-agnostic JWT bearer validation (`Core/Auth`: `IJwtAccessTokenValidator`, `Authority`/
+  `Audience`-driven config, `"OidcAuthority"` mode fetches signing keys from the IdP's real discovery document —
+  the same mechanism ASP.NET Core's own JWT bearer handler uses)
+- [x] `Management`: JWT required on all `/tenants/**` routes (`AdminAuthenticationFilter`) — fully built and
+  verified live (superadmin trust model: any valid token, no per-tenant admin restriction — open item)
+- [~] `Api`: JWT accepted on the data-plane (`TenantAuthenticationFilter`), verified live with a locally-minted
+  token resolving to a real tenant and its BYOK credential — **but** the legacy hashed-API-key scheme (Phase 3)
+  is kept as a parallel, still-primary path, not replaced, because full OAuth2 client-credentials requires
+  dynamic per-tenant client registration with a real IdP, which is blocked on having a real IdP account (see
+  below)
+- [ ] Managed IdP integration (Entra ID external tenants or Auth0) — **blocked**: no real IdP account available
+  to build/verify OIDC discovery or dynamic client registration against. The validation *layer* is IdP-agnostic
+  and ready (above); nothing has been tested against a real Entra ID/Auth0 tenant. Revisit when an account is
+  available — see `ARCHITECTURE.md`'s "Open questions".
+
+Scope note: given the IdP-account blocker, this phase deliberately built the reusable validation layer generic
+across any OIDC-compliant IdP and applied it where it doesn't need one (Management's single-app admin login is
+straightforward JWT validation; Api's dual-scheme is a bridge, not the end state). Local dev/test verification
+used `"StaticKey"` mode (`LocalDevTokenIssuer`, `src/DevTools` CLI) — signing a token locally, never through an
+HTTP endpoint on the running gateway, since "the gateway never issues tokens" is a hard architectural rule, not
+just a production concern.
+
+Verified live end-to-end: booted `Api` + `Management` against real Postgres; confirmed `/healthz` stays open
+while `/tenants/**` now 401s without a token; created a tenant and set a provider credential using an admin JWT;
+minted a second, tenant-scoped JWT and used it (not an API key) to call `/v1/chat/completions`, confirming it
+resolved the correct tenant and BYOK credential (reached the real OpenAI host, got an OpenAI-shaped error for
+the intentionally-fake key); confirmed the legacy API-key path still works unchanged; confirmed a JWT for a
+nonexistent tenant is rejected with `401`.
 
 ## Phase 5 — Streaming
 - [ ] SSE passthrough (`stream: true`) for both providers

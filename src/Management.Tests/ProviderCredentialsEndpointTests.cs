@@ -15,7 +15,7 @@ public class ProviderCredentialsEndpointTests : IClassFixture<ManagementApiFacto
     public ProviderCredentialsEndpointTests(ManagementApiFactory factory)
     {
         _factory = factory;
-        _client = factory.CreateClient();
+        _client = factory.CreateAuthenticatedClient();
     }
 
     private async Task<Guid> CreateTenantAsync(string name)

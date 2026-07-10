@@ -1,7 +1,9 @@
+using Core.Auth;
 using Core.Persistence;
 using Core.Providers;
 using Core.Secrets;
 using Core.Tenancy;
+using Management.Authentication;
 using Management.Endpoints;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -11,6 +13,7 @@ var connectionString = builder.Configuration.GetConnectionString("Gateway")
 builder.Services.AddGatewayPersistence(connectionString);
 builder.Services.AddProviderClients(builder.Configuration);
 builder.Services.AddGatewaySecrets(builder.Configuration);
+builder.Services.AddManagedIdentityAuthentication(builder.Configuration);
 
 var app = builder.Build();
 
@@ -25,9 +28,10 @@ app.Use(async (context, next) =>
     await next(context);
 });
 
-app.MapTenants();
-app.MapApiKeys();
-app.MapProviderCredentials();
+var tenantsGroup = app.MapGroup("/tenants").AddEndpointFilter<AdminAuthenticationFilter>();
+tenantsGroup.MapTenants();
+tenantsGroup.MapApiKeys();
+tenantsGroup.MapProviderCredentials();
 
 app.Run();
 

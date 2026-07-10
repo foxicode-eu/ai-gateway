@@ -12,7 +12,7 @@ public static class ChatCompletionsEndpoint
     public static IEndpointRouteBuilder MapChatCompletions(this IEndpointRouteBuilder app)
     {
         app.MapPost("/v1/chat/completions", HandleAsync)
-            .AddEndpointFilter<ApiKeyAuthenticationFilter>();
+            .AddEndpointFilter<TenantAuthenticationFilter>();
         return app;
     }
 

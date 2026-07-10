@@ -1,4 +1,5 @@
 using Api.Endpoints;
+using Core.Auth;
 using Core.Persistence;
 using Core.Providers;
 using Core.Secrets;
@@ -12,6 +13,7 @@ builder.Services.AddGatewayPersistence(connectionString);
 builder.Services.AddProviderClients(builder.Configuration);
 builder.Services.AddGatewaySecrets(builder.Configuration);
 builder.Services.AddApiKeyAuthentication();
+builder.Services.AddManagedIdentityAuthentication(builder.Configuration);
 
 var app = builder.Build();
 

@@ -7,11 +7,11 @@ namespace Management.Endpoints;
 
 public static class ApiKeysEndpoint
 {
-    public static IEndpointRouteBuilder MapApiKeys(this IEndpointRouteBuilder app)
+    public static IEndpointRouteBuilder MapApiKeys(this IEndpointRouteBuilder tenantsGroup)
     {
-        app.MapPost("/tenants/{tenantId:guid}/api-keys", CreateAsync);
-        app.MapDelete("/tenants/{tenantId:guid}/api-keys/{apiKeyId:guid}", RevokeAsync);
-        return app;
+        tenantsGroup.MapPost("/{tenantId:guid}/api-keys", CreateAsync);
+        tenantsGroup.MapDelete("/{tenantId:guid}/api-keys/{apiKeyId:guid}", RevokeAsync);
+        return tenantsGroup;
     }
 
     public sealed record CreateApiKeyRequest(string Name);

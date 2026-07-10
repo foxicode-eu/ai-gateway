@@ -1,8 +1,10 @@
 using System.Net;
 using System.Net.Http.Headers;
 using System.Net.Http.Json;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json.Nodes;
+using Core.Auth;
 using Core.Entities;
 using Core.Persistence;
 using Microsoft.EntityFrameworkCore.Infrastructure;
@@ -62,6 +64,17 @@ public class ChatCompletionsEndpointTests : IClassFixture<WebApplicationFactory<
     private readonly StubSecretStore _stubSecretStore = new();
     private readonly string _databaseName = Guid.NewGuid().ToString();
 
+    private readonly AuthenticationOptions _authenticationOptions = new()
+    {
+        Mode = "StaticKey",
+        Audience = "api-tests",
+        StaticKey = new StaticKeyOptions
+        {
+            Issuer = "api-tests",
+            SigningKey = Convert.ToBase64String(RandomNumberGenerator.GetBytes(32)),
+        },
+    };
+
     private Guid _tenantId;
     private string _apiKey = "";
 
@@ -80,6 +93,15 @@ public class ChatCompletionsEndpointTests : IClassFixture<WebApplicationFactory<
 
                 services.RemoveAll<ISecretStore>();
                 services.AddSingleton<ISecretStore>(_stubSecretStore);
+
+                var authOptions = _authenticationOptions;
+                services.Configure<AuthenticationOptions>(o =>
+                {
+                    o.Mode = authOptions.Mode;
+                    o.Audience = authOptions.Audience;
+                    o.TenantIdClaimType = authOptions.TenantIdClaimType;
+                    o.StaticKey = authOptions.StaticKey;
+                });
             });
         });
     }
@@ -114,6 +136,14 @@ public class ChatCompletionsEndpointTests : IClassFixture<WebApplicationFactory<
     {
         var client = _factory.CreateClient();
         client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", _apiKey);
+        return client;
+    }
+
+    private HttpClient CreateJwtAuthenticatedClient(Guid tenantId)
+    {
+        var client = _factory.CreateClient();
+        var token = LocalDevTokenIssuer.IssueToken(_authenticationOptions, tenantId);
+        client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", token);
         return client;
     }
 
@@ -219,5 +249,43 @@ public class ChatCompletionsEndpointTests : IClassFixture<WebApplicationFactory<
             new StringContent("""{"model":"claude-3-5-sonnet-20241022"}""", Encoding.UTF8, "application/json"));
 
         Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task Authenticates_via_a_valid_jwt_carrying_the_tenant_id_claim()
+    {
+        var client = CreateJwtAuthenticatedClient(_tenantId);
+
+        var response = await client.PostAsync(
+            "/v1/chat/completions",
+            new StringContent("""{"model":"gpt-4o-mini","messages":[]}""", Encoding.UTF8, "application/json"));
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        Assert.Equal("sk-tenant-openai-key", _stubOpenAiClient.LastApiKey);
+    }
+
+    [Fact]
+    public async Task Rejects_a_jwt_whose_tenant_id_claim_does_not_match_a_known_tenant()
+    {
+        var client = CreateJwtAuthenticatedClient(Guid.NewGuid());
+
+        var response = await client.PostAsync(
+            "/v1/chat/completions",
+            new StringContent("""{"model":"gpt-4o-mini"}""", Encoding.UTF8, "application/json"));
+
+        Assert.Equal(HttpStatusCode.Unauthorized, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task Rejects_a_jwt_looking_credential_with_an_invalid_signature()
+    {
+        var client = _factory.CreateClient();
+        client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", "not.a.validjwt");
+
+        var response = await client.PostAsync(
+            "/v1/chat/completions",
+            new StringContent("""{"model":"gpt-4o-mini"}""", Encoding.UTF8, "application/json"));
+
+        Assert.Equal(HttpStatusCode.Unauthorized, response.StatusCode);
     }
 }

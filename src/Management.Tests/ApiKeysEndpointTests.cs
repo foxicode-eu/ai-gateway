@@ -12,7 +12,7 @@ public class ApiKeysEndpointTests : IClassFixture<ManagementApiFactory>
 
     public ApiKeysEndpointTests(ManagementApiFactory factory)
     {
-        _client = factory.CreateClient();
+        _client = factory.CreateAuthenticatedClient();
     }
 
     private async Task<Guid> CreateTenantAsync(string name)

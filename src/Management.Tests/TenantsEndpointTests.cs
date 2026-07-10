@@ -8,11 +8,13 @@ namespace Management.Tests;
 
 public class TenantsEndpointTests : IClassFixture<ManagementApiFactory>
 {
+    private readonly ManagementApiFactory _factory;
     private readonly HttpClient _client;
 
     public TenantsEndpointTests(ManagementApiFactory factory)
     {
-        _client = factory.CreateClient();
+        _factory = factory;
+        _client = factory.CreateAuthenticatedClient();
     }
 
     [Fact]
@@ -46,5 +48,15 @@ public class TenantsEndpointTests : IClassFixture<ManagementApiFactory>
         var response = await _client.GetAsync($"/tenants/{Guid.NewGuid()}");
 
         Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task Rejects_requests_without_a_valid_admin_token()
+    {
+        var unauthenticatedClient = _factory.CreateClient();
+
+        var response = await unauthenticatedClient.PostAsJsonAsync("/tenants", new TenantsEndpoint.CreateTenantRequest("Acme"));
+
+        Assert.Equal(HttpStatusCode.Unauthorized, response.StatusCode);
     }
 }

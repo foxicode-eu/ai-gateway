@@ -7,10 +7,10 @@ namespace Management.Endpoints;
 
 public static class ProviderCredentialsEndpoint
 {
-    public static IEndpointRouteBuilder MapProviderCredentials(this IEndpointRouteBuilder app)
+    public static IEndpointRouteBuilder MapProviderCredentials(this IEndpointRouteBuilder tenantsGroup)
     {
-        app.MapPut("/tenants/{tenantId:guid}/providers/{providerName}", SetAsync);
-        return app;
+        tenantsGroup.MapPut("/{tenantId:guid}/providers/{providerName}", SetAsync);
+        return tenantsGroup;
     }
 
     public sealed record SetProviderCredentialRequest(string ApiKey);
