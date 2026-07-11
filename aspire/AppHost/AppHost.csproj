@@ -1,0 +1,26 @@
+<Project Sdk="Aspire.AppHost.Sdk/13.4.6">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <UserSecretsId>f8168281-f181-4ed5-9862-2faad8842402</UserSecretsId>
+    <!-- Not part of src/Gateway.slnx on purpose — this is an optional local-dev orchestration layer, not
+         something CI or a plain `dotnet build src/Gateway.slnx` should need to pull in. See aspire/README.md. -->
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Aspire.Hosting.AppHost" Version="13.4.6" />
+    <PackageReference Include="Aspire.Hosting.PostgreSQL" Version="13.4.6" />
+    <PackageReference Include="Aspire.Hosting.Redis" Version="13.4.6" />
+    <PackageReference Include="Aspire.Hosting.Yarp" Version="13.4.6" />
+    <PackageReference Include="Aspire.Hosting.NodeJs" Version="9.5.2" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../../src/Api/Api.csproj" />
+    <ProjectReference Include="../../src/Management/Management.csproj" />
+  </ItemGroup>
+
+</Project>

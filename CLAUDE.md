@@ -26,6 +26,9 @@ update it as phases complete. Update `ARCHITECTURE.md` too if you make a decisio
 questions". Note Phase 10's deployment artifacts (`deploy/`, the three `Dockerfile`s, `.github/workflows/cd.yml`)
 were built and locally verified (`docker build`/`docker compose`/`az bicep build`) but **not exercised against a
 real Azure subscription** — no cloud credentials are available in this environment. See `deploy/README.md`.
+Separately, `aspire/AppHost` is a .NET Aspire + YARP local-orchestration layer (one `dotnet run` → Postgres,
+Redis, `Api`, `Management`, Dashboard, all fronted by a single unified URL) — not part of `src/Gateway.slnx`,
+see `aspire/README.md`.
 
 ## Solution structure
 
@@ -362,7 +365,11 @@ usage endpoint reflected it correctly (1 request, 1 error, grouped under `"opena
   CSS v4 (`src/components/ui/*`, manually authored — not CLI-scaffolded, for environment-reliability reasons —
   `src/index.css` has the theme tokens), Recharts (usage chart). `vite.config.ts` proxies `/api/**` to
   `Management` (`http://localhost:5162`) so the browser talks same-origin — see "Sessions" above for why that
-  matters for cookies. `src/lib/api.ts` is a thin `fetch` wrapper (`credentials: 'include'` on every call,
+  matters for cookies. `server.allowedHosts: true` is set because Vite 5+ rejects requests with an unrecognized
+  `Host` header by default, and when this dev server is run behind the `aspire/` AppHost's YARP gateway (see
+  Commands below), the proxied request's `Host` is Aspire's own internal service-discovery hostname, not
+  `localhost` — harmless to leave permissive since this dev server was never reachable from outside the host
+  machine anyway. `src/lib/api.ts` is a thin `fetch` wrapper (`credentials: 'include'` on every call,
   `ApiError` with a `status` for callers to branch on 401s) with one function per `Management` endpoint.
   `src/lib/auth.tsx`'s `AuthProvider`/`useAuth()` wraps the `GET /auth/session` query plus login/logout
   mutations; `RequireAuth.tsx` redirects unauthenticated users to `/login`. Pages: `LoginPage`, `TenantsListPage`
@@ -624,3 +631,26 @@ dotnet ef database update --project src/Core --startup-project src/Core   # firs
 its nginx reverse proxy). `docker compose -f docker-compose.yml -f docker-compose.full.yml down` to stop (add
 `-v` only if you also want to wipe the Postgres/Redis/secrets volumes — that deletes local dev data, not just
 this smoke test's).
+
+### Running everything via .NET Aspire + YARP (single unified local URL)
+
+`aspire/AppHost` is a third local-run option, distinct from both of the above: one `dotnet run` starts Postgres,
+Redis, `Api`, `Management`, and the Dashboard's Vite dev server, applies EF Core migrations automatically, and
+fronts all of it behind a single YARP gateway URL (`http://localhost:5100` — `/v1/**`/`/.well-known/**` →
+`Api` unprefixed, `/api/**` → `Management` with the prefix stripped, everything else → the Dashboard). Not part
+of `src/Gateway.slnx`.
+
+```bash
+cd aspire/AppHost
+ASPIRE_ALLOW_UNSECURED_TRANSPORT=true dotnet run --launch-profile http
+```
+
+See `aspire/README.md` for the full picture, including two real bugs this orchestration surfaced that a plain
+`curl`-for-200 check wouldn't have caught: Aspire's NodeJs hosting defaults child processes to
+`NODE_ENV=production`, which silently disables Vite's React Fast Refresh preamble (page loads, but every
+component throws `$RefreshSig$ is not defined` the instant a real browser evaluates it); and combining a
+persistent Postgres data volume with Aspire's per-run auto-generated password means the *second* run's Postgres
+container can't authenticate its own migrations job and everything downstream hangs forever waiting on it — only
+caught by actually running the AppHost twice, not once. Every run starts from a fresh empty database (no
+persistent volume, deliberately — see `aspire/README.md`); for data that survives across runs, use the
+`docker-compose.yml` + `dotnet run` workflow above instead.
