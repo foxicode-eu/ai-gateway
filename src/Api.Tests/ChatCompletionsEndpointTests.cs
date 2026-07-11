@@ -4,6 +4,7 @@ using System.Net.Http.Json;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json.Nodes;
+using Core.Alerting;
 using Core.Auth;
 using Core.Entities;
 using Core.Persistence;
@@ -82,9 +83,21 @@ public class ChatCompletionsEndpointTests : IClassFixture<WebApplicationFactory<
         }
     }
 
+    private sealed class StubQuotaAlertSender : IQuotaAlertSender
+    {
+        public List<QuotaAlertPayload> SentPayloads { get; } = [];
+
+        public Task SendAsync(string webhookUrl, QuotaAlertPayload payload, CancellationToken cancellationToken)
+        {
+            SentPayloads.Add(payload);
+            return Task.CompletedTask;
+        }
+    }
+
     private readonly WebApplicationFactory<Program> _factory;
     private readonly StubProviderClient _stubOpenAiClient = new("openai");
     private readonly StubSecretStore _stubSecretStore = new();
+    private readonly StubQuotaAlertSender _stubQuotaAlertSender = new();
     private readonly string _databaseName = Guid.NewGuid().ToString();
 
     private readonly AuthenticationOptions _authenticationOptions = new()
@@ -119,6 +132,9 @@ public class ChatCompletionsEndpointTests : IClassFixture<WebApplicationFactory<
 
                 services.RemoveAll<IRateLimitStore>();
                 services.AddSingleton<IRateLimitStore, InMemoryRateLimitStore>();
+
+                services.RemoveAll<IQuotaAlertSender>();
+                services.AddSingleton<IQuotaAlertSender>(_stubQuotaAlertSender);
 
                 var authOptions = _authenticationOptions;
                 services.Configure<AuthenticationOptions>(o =>
@@ -524,5 +540,97 @@ public class ChatCompletionsEndpointTests : IClassFixture<WebApplicationFactory<
         var usageEvent = await GetLatestUsageEventAsync();
         Assert.Equal("anthropic", usageEvent.Provider);
         Assert.Equal(400, usageEvent.StatusCode);
+    }
+
+    private async Task ConfigureAlertingAsync(int tokenQuotaPerWindow, string webhookUrl, params int[] thresholdPercentages)
+    {
+        using var scope = _factory.Services.CreateScope();
+        var dbContext = scope.ServiceProvider.GetRequiredService<GatewayDbContext>();
+        var tenant = await dbContext.Tenants.FirstAsync(t => t.Id == _tenantId);
+        tenant.TokenQuotaPerWindow = tokenQuotaPerWindow;
+        tenant.AlertWebhookUrl = webhookUrl;
+        tenant.AlertThresholdPercentages = thresholdPercentages;
+        await dbContext.SaveChangesAsync();
+    }
+
+    private async Task<HttpResponseMessage> PostChatCompletionAsync(HttpClient client, int promptTokens, int completionTokens)
+    {
+        _stubOpenAiClient.Response = new ProviderResponse(200, new JsonObject
+        {
+            ["id"] = "resp-1",
+            ["usage"] = new JsonObject { ["prompt_tokens"] = promptTokens, ["completion_tokens"] = completionTokens },
+        });
+        return await client.PostAsync(
+            "/v1/chat/completions", new StringContent("""{"model":"gpt-4o-mini"}""", Encoding.UTF8, "application/json"));
+    }
+
+    [Fact]
+    public async Task Fires_a_quota_alert_webhook_once_a_configured_threshold_is_crossed()
+    {
+        await ConfigureAlertingAsync(tokenQuotaPerWindow: 100, "https://example.com/hooks/quota", 80);
+        var client = CreateAuthenticatedClient();
+
+        await PostChatCompletionAsync(client, promptTokens: 40, completionTokens: 40); // 80/100 = 80%
+
+        var payload = Assert.Single(_stubQuotaAlertSender.SentPayloads);
+        Assert.Equal(_tenantId, payload.TenantId);
+        Assert.Equal(80, payload.ThresholdPercentage);
+        Assert.Equal(100, payload.QuotaLimit);
+    }
+
+    [Fact]
+    public async Task Does_not_fire_a_quota_alert_below_the_configured_threshold()
+    {
+        await ConfigureAlertingAsync(tokenQuotaPerWindow: 100, "https://example.com/hooks/quota", 80);
+        var client = CreateAuthenticatedClient();
+
+        await PostChatCompletionAsync(client, promptTokens: 10, completionTokens: 10); // 20/100 = 20%
+
+        Assert.Empty(_stubQuotaAlertSender.SentPayloads);
+    }
+
+    [Fact]
+    public async Task Does_not_re_fire_the_same_threshold_twice_within_a_window()
+    {
+        await ConfigureAlertingAsync(tokenQuotaPerWindow: 100, "https://example.com/hooks/quota", 80);
+        var client = CreateAuthenticatedClient();
+
+        await PostChatCompletionAsync(client, promptTokens: 40, completionTokens: 40); // crosses 80%
+        await PostChatCompletionAsync(client, promptTokens: 1, completionTokens: 1); // still above 80%
+
+        Assert.Single(_stubQuotaAlertSender.SentPayloads);
+    }
+
+    [Fact]
+    public async Task Fires_a_second_alert_when_a_higher_threshold_is_subsequently_crossed()
+    {
+        await ConfigureAlertingAsync(tokenQuotaPerWindow: 100, "https://example.com/hooks/quota", 80, 100);
+        var client = CreateAuthenticatedClient();
+
+        await PostChatCompletionAsync(client, promptTokens: 40, completionTokens: 40); // 80%
+        await PostChatCompletionAsync(client, promptTokens: 10, completionTokens: 10); // 100%
+
+        Assert.Equal(2, _stubQuotaAlertSender.SentPayloads.Count);
+        Assert.Equal(80, _stubQuotaAlertSender.SentPayloads[0].ThresholdPercentage);
+        Assert.Equal(100, _stubQuotaAlertSender.SentPayloads[1].ThresholdPercentage);
+    }
+
+    [Fact]
+    public async Task Does_not_alert_when_no_webhook_is_configured()
+    {
+        using (var scope = _factory.Services.CreateScope())
+        {
+            var dbContext = scope.ServiceProvider.GetRequiredService<GatewayDbContext>();
+            var tenant = await dbContext.Tenants.FirstAsync(t => t.Id == _tenantId);
+            tenant.TokenQuotaPerWindow = 100;
+            tenant.AlertThresholdPercentages = [80];
+            // AlertWebhookUrl deliberately left null.
+            await dbContext.SaveChangesAsync();
+        }
+        var client = CreateAuthenticatedClient();
+
+        await PostChatCompletionAsync(client, promptTokens: 40, completionTokens: 40);
+
+        Assert.Empty(_stubQuotaAlertSender.SentPayloads);
     }
 }

@@ -16,13 +16,13 @@ out of order. Read both before making structural decisions (new projects, auth f
 
 ## Current state
 
-Phases 0–8 are done (solution scaffolding, core domain + persistence, walking-skeleton proxy, multi-tenancy +
-BYOK credentials, JWT/managed-IdP auth, streaming, rate limiting, observability + usage data, Dashboard) — see
-`ROADMAP.md` for what's next. `Api` accepts both a JWT and a legacy hashed API key (see "AuthN" below — this is
-a deliberate, temporary dual-scheme, not an oversight). `Management` accepts both a session cookie and a bearer
-JWT — same deliberate dual-scheme idea, see "Sessions" below. Check `ROADMAP.md` before starting new work so
-you're building the current phase, not a later one out of order, and update it as phases complete. Update
-`ARCHITECTURE.md` too if you make a decision that resolves one of its "Open questions".
+Phases 0–9 are done (solution scaffolding, core domain + persistence, walking-skeleton proxy, multi-tenancy +
+BYOK credentials, JWT/managed-IdP auth, streaming, rate limiting, observability + usage data, Dashboard, quota
+alerting) — see `ROADMAP.md` for what's next. `Api` accepts both a JWT and a legacy hashed API key (see "AuthN"
+below — this is a deliberate, temporary dual-scheme, not an oversight). `Management` accepts both a session
+cookie and a bearer JWT — same deliberate dual-scheme idea, see "Sessions" below. Check `ROADMAP.md` before
+starting new work so you're building the current phase, not a later one out of order, and update it as phases
+complete. Update `ARCHITECTURE.md` too if you make a decision that resolves one of its "Open questions".
 
 ## Solution structure
 
@@ -68,7 +68,9 @@ nullable reference types and implicit usings enabled.
   - `POST /tenants`, `GET /tenants` (list, ordered by name), `GET /tenants/{tenantId}`, `PATCH /tenants/{tenantId}`
     — tenant CRUD (no delete). Create and patch both accept an optional `tokenQuotaPerWindow` (null = unlimited;
     `PATCH` with `null` clears it back to unlimited — it's not "unset means don't change", the field is always
-    applied as given).
+    applied as given) plus optional `alertWebhookUrl`/`alertThresholdPercentages` (same "always applied as
+    given" rule — see "Quota alerting" below). `alertWebhookUrl` must be an absolute `http(s)` URL if given;
+    each threshold must be `1`–`100`.
   - `POST /tenants/{tenantId}/api-keys`, `GET /tenants/{tenantId}/api-keys` (list — never the hash or plaintext),
     `PATCH /tenants/{tenantId}/api-keys/{apiKeyId}` — issues a key (the plaintext is only ever in the create
     response — `ApiKeyGenerator.GenerateSecret()`/`.Hash()` in `Core/Security`, the DB stores only the hash) and
@@ -101,6 +103,7 @@ nullable reference types and implicit usings enabled.
   - `RateLimiting/` — see the dedicated "Rate limiting" section below.
   - `Observability/` — see the dedicated "Observability & usage data" section below.
   - `Sessions/` — see the dedicated "Sessions" section below.
+  - `Alerting/` — see the dedicated "Quota alerting" section below.
   - `Persistence/` — `GatewayDbContext` (EF Core + Npgsql), `GatewayDbContextFactory` (design-time factory for
     `dotnet ef` tooling), `ServiceCollectionExtensions.AddGatewayPersistence` (DI registration), and
     `Migrations/` (EF Core migrations — commit these, don't hand-edit generated migration files).
@@ -266,6 +269,56 @@ tenant with no configured quota is not blocked and reaches the real provider hos
 same live wasn't practical without a real provider API key, since a failed provider call (the only kind
 possible with a fake key) never produces token usage to record.
 
+### Quota alerting
+
+Opt-in per tenant: `Core.Entities.Tenant.AlertWebhookUrl` (null = alerting disabled) and
+`AlertThresholdPercentages` (`int[]`, e.g. `[80, 100]` — percentages of `TokenQuotaPerWindow`; meaningless
+without a quota also configured, since there's nothing to be a percentage of). Configured via `Management`'s
+`PATCH /tenants/{id}` (see above) and the Dashboard's "Token quota & alerts" card (`QuotaCard.tsx` — one form,
+one Save button, covering quota + webhook URL + comma-separated thresholds together, specifically so a plain
+quota edit can't accidentally null out the alert fields via the "always applied as given" `PATCH` semantics).
+Webhook delivery only for now — email was the other option on the table, deferred, see `ARCHITECTURE.md`'s open
+questions.
+
+`Core/Alerting`: `IQuotaAlertSender`/`WebhookQuotaAlertSender` (POSTs a `QuotaAlertPayload` — tenant ID,
+crossed-threshold percentage, usage percentage, quota limit, current usage, timestamp — as JSON to the tenant's
+webhook URL via a plain `HttpClient`, no `BaseAddress` since the URL is per-tenant and arbitrary, not a fixed
+provider host) and `AddGatewayAlerting` (DI registration, `Api`-only — `Management` doesn't proxy chat requests
+so has nothing to alert on).
+
+`Api/Alerting/QuotaAlertGate.cs` is the piece that actually decides whether to fire, called from
+`ChatCompletionsEndpoint`'s `FinishAsync` right after `RateLimitGate.RecordUsageAsync` on every request exit
+path (so alerting can never itself skip a request that skipped usage recording, or vice versa). It re-checks the
+tenant's usage via `ITokenRateLimiter.CheckAsync` against the *same* Redis/in-memory key `RateLimitGate` enforces
+admission with (`Core.RateLimiting.RateLimitKeys.TenantKey` — extracted to its own class specifically so the two
+call sites can't drift apart on the key format, the same kind of format-string-must-match gotcha `CLAUDE.md`
+already flags for `RateLimitGate`/`TokenRateLimiter`), so it's reusing the same blended sliding-window estimate,
+not a second independent counter. If usage now sits at or above the *highest* configured threshold that's been
+crossed, that's the one threshold that fires — crossing 80% and 100% in the same check (e.g. a big single
+request) fires once for 100%, not twice.
+
+**Anti-duplicate-per-window state**: `IRateLimitStore` only exposes increment/get, no "set" — so "don't re-alert
+for a threshold (or lower) already fired this window" is tracked in a `alert:tenant:{tenantId:N}:{windowIndex}`
+key (same store, same window-index formula as `TokenRateLimiter`, computed independently since that formula is
+private to `TokenRateLimiter`) whose value is pushed up to the newly-crossed threshold via `IncrementAsync(...,
+crossedThreshold - alreadyAlerted, ...)` — the only way to express "move this counter up to at least X" with an
+increment-only primitive. A new window (naturally, since the key is namespaced by `windowIndex`) starts this at
+zero again, so alerting resets exactly the way rate-limit quotas do.
+
+A webhook delivery failure (unreachable host, non-2xx response) is logged (`ILogger`, Warning level) and
+swallowed inside `QuotaAlertGate` — a tenant's misconfigured webhook must never break the chat-completion request
+that triggered the check.
+
+**Verified live against real Redis and a real HTTP webhook receiver**: created a tenant via `Management` with a
+100-token quota and thresholds `[50, 90]` pointed at a local webhook receiver; manually seeded the *same* Redis
+rate-limit counter key `RateLimitGate` uses (mirroring the Phase 6 live-verification approach) to 55/100 tokens,
+then sent one real chat-completion request through `Api` — confirmed the receiver got a real chunked-encoding
+POST with the exact expected JSON payload (`thresholdPercentage: 50`). Re-seeded to 92/100 (past both
+thresholds) and confirmed exactly one alert fired, for the *higher* threshold (`90`), not two. A second request
+within the same rate-limit window did not re-fire; a request landing in the next window (observed incidentally,
+via real outbound-network latency to `api.openai.com` pushing a follow-up request past a window boundary) did
+correctly fire again — confirming the per-window reset works as designed, not just the same-window dedup path.
+
 ### Observability & usage data
 
 `Core/Observability`: `AddGatewayObservability(configuration, serviceName)` wires up OpenTelemetry — ASP.NET
@@ -305,15 +358,21 @@ usage endpoint reflected it correctly (1 request, 1 error, grouped under `"opena
   deliberately not installed), TanStack Query (`src/lib/auth.tsx`, per-page data hooks), shadcn/ui + Tailwind
   CSS v4 (`src/components/ui/*`, manually authored — not CLI-scaffolded, for environment-reliability reasons —
   `src/index.css` has the theme tokens), Recharts (usage chart). `vite.config.ts` proxies `/api/**` to
-  `Management` (`http://localhost:5299`) so the browser talks same-origin — see "Sessions" above for why that
+  `Management` (`http://localhost:5162`) so the browser talks same-origin — see "Sessions" above for why that
   matters for cookies. `src/lib/api.ts` is a thin `fetch` wrapper (`credentials: 'include'` on every call,
   `ApiError` with a `status` for callers to branch on 401s) with one function per `Management` endpoint.
   `src/lib/auth.tsx`'s `AuthProvider`/`useAuth()` wraps the `GET /auth/session` query plus login/logout
   mutations; `RequireAuth.tsx` redirects unauthenticated users to `/login`. Pages: `LoginPage`, `TenantsListPage`
   (list + create-tenant dialog), `TenantDetailPage` (composes `QuotaCard`/`ApiKeysCard`/`ProvidersCard`/
-  `UsageCard` under `pages/tenant-detail/`). No automated test suite yet (open item in `ARCHITECTURE.md`) —
-  verified so far by `npm run build`/`npm run lint` plus live headless-browser driving (see "Sessions" above for
-  the one real bug that surfaced that way).
+  `UsageCard` under `pages/tenant-detail/` — `QuotaCard` handles both the token quota and its alert
+  webhook/thresholds in one form, see "Quota alerting" below for why they're not split across two saves). No
+  automated test suite yet (open item in `ARCHITECTURE.md`) — verified so far by `npm run build`/`npm run lint`
+  plus live headless-browser driving (see "Sessions" above for the one real bug that surfaced that way).
+  **Real bug found via the same live-driving process, Phase 9**: `vite.config.ts`'s dev proxy target was
+  `http://localhost:5299`, but `Management`'s actual `launchSettings.json` dev port is `5162` (`5299`/`5298` only
+  ever existed in a stale copy-paste in this file's own command walkthroughs, now fixed) — the Dashboard would
+  have 404'd on every `/api/**` call in local dev. Caught because live-driving the UI is a real HTTP round trip
+  through the actual proxy, not a mock.
 - `src/Core.Tests/` — covers the tenant query-filter behavior, both provider clients incl. streaming (fake
   `HttpMessageHandler` + `FakeStreamResponseWriter`, no real network calls — including the error-before-streaming
   path for both providers), the Anthropic translators, both non-streaming (pure-function tests) and streaming
@@ -321,9 +380,11 @@ usage endpoint reflected it correctly (1 request, 1 error, grouped under `"opena
   resulting OpenAI-shaped chunks and final usage), the provider-registration regression above, `ApiKeyGenerator`,
   `LocalDevSecretStore` (round-trip + cross-instance decryption using `EphemeralDataProtectionProvider`), and
   `JwtAccessTokenValidator`/`LocalDevTokenIssuer` (valid/expired/wrong-key/wrong-audience/wrong-issuer/malformed
-  tokens, all in `"StaticKey"` mode — no network calls, no real IdP needed), and `TokenRateLimiter` (against
+  tokens, all in `"StaticKey"` mode — no network calls, no real IdP needed), `TokenRateLimiter` (against
   `InMemoryRateLimitStore` + a hand-rolled `ManualTimeProvider` test double — deterministic control over
-  elapsed-window fraction, including the exact-boundary and decay-mid-window cases, without any real waiting).
+  elapsed-window fraction, including the exact-boundary and decay-mid-window cases, without any real waiting),
+  and `WebhookQuotaAlertSender` (fake `HttpMessageHandler` — asserts the JSON payload shape and that a non-2xx
+  response throws, no real network call).
 - `src/Api.Tests/` — `ChatCompletionsEndpointTests.cs`, a `WebApplicationFactory<Program>` integration test.
   Swaps in the EF Core InMemory provider for `GatewayDbContext` (see the `RemoveAll<DbContextOptions<...>>` +
   `RemoveAll<IDbContextOptionsConfiguration<...>>` + re-`AddDbContext` pattern — both removals are needed, or
@@ -338,9 +399,12 @@ usage endpoint reflected it correctly (1 request, 1 error, grouped under `"opena
   "can we still change status code from inside the stream callback" assumption lives), and rate limiting
   (overrides `IRateLimitStore` with `InMemoryRateLimitStore` to avoid a real Redis dependency in tests — tenant
   quota blocking, api-key quota blocking with room left on the tenant, no-quota-configured passthrough, and JWT
-  auth not being subject to a per-key quota), and usage-event persistence (asserts the `UsageEvent` row written
+  auth not being subject to a per-key quota), usage-event persistence (asserts the `UsageEvent` row written
   for successful, streaming, rate-limited, and no-credential requests has the right tenant/provider/model/status/
-  token/streamed values). Tests that reach into `GatewayDbContext` directly outside of an
+  token/streamed values), and quota alerting (a stub `IQuotaAlertSender` capturing sent payloads — fires once a
+  configured threshold is crossed, doesn't fire below it, doesn't re-fire the same threshold twice in one
+  window, fires again for a *higher* threshold crossed in a later check, and never fires when no webhook is
+  configured). Tests that reach into `GatewayDbContext` directly outside of an
   HTTP request (e.g. to set a quota mid-test) need `.IgnoreQueryFilters()` on `ApiKeys` queries — there's no
   ambient `TenantScope` in a bare `CreateScope()`, so the fail-closed default (`Blocked`) hides everything,
   same underlying mechanism as the `Tenancy` bullet above, just easy to trip over again in a new spot.
@@ -362,7 +426,11 @@ usage endpoint reflected it correctly (1 request, 1 error, grouped under `"opena
   invalidates the session, `GET /auth/session` reflects current login state, and a bearer token still works with
   no session cookie present (the dual-scheme path). Since `WebApplicationFactory`'s client has no automatic
   cookie jar, these tests extract `Set-Cookie` from the login response and attach it manually via a `Cookie`
-  header on subsequent requests.
+  header on subsequent requests. `TenantsEndpointTests` also covers alert-field validation and round-tripping:
+  a non-absolute `alertWebhookUrl` and an out-of-range (outside `1`–`100`) threshold are both rejected with
+  `400`, a valid webhook URL + threshold list round-trips through create/update/get, and a `PATCH` with both
+  fields omitted clears alerting back to disabled (same "always applied as given" semantics as
+  `tokenQuotaPerWindow`).
   **Gotcha already hit once:** generate the InMemory database name *once* (e.g. a field, computed outside the
   `AddDbContext` configure lambda) and reuse it — generating it inline inside the lambda (`UseInMemoryDatabase(Guid.NewGuid().ToString())`)
   means every time EF Core re-invokes that delegate you silently get a fresh, empty database, so data written by
@@ -430,7 +498,15 @@ to point at a real collector.
 
 To inspect rate-limit counters directly: `docker exec ai-gateway-redis-1 redis-cli KEYS 'ratelimit:*'` (keys are
 `ratelimit:tenant:{tenantId:N}:{windowIndex}` / `ratelimit:apikey:{apiKeyId:N}:{windowIndex}`, see
-`RateLimitGate`/`TokenRateLimiter`).
+`RateLimitGate`/`TokenRateLimiter`). Quota-alert anti-duplicate state lives alongside it under
+`alert:tenant:{tenantId:N}:{windowIndex}` (see "Quota alerting" above) — same store, same `KEYS 'alert:*'` to
+inspect. To trigger a real alert locally without a real provider API key (a failed provider call never produces
+token usage to record on its own), seed the tenant's *rate-limit* counter directly to simulate usage past a
+threshold, then send any request:
+```bash
+docker exec ai-gateway-redis-1 redis-cli SET "ratelimit:tenant:<tenantId:N>:<windowIndex>" 92 EX 120
+```
+(`windowIndex` = `unix-seconds / RateLimiting:WindowSeconds`, `tenantId:N` = the GUID with no dashes.)
 
 CI (`.github/workflows/ci.yml`) runs `dotnet build`/`dotnet test` on the solution and `npm run build` on the
 Dashboard for every PR. It does not currently run against a real Postgres instance or apply migrations — that's
@@ -446,22 +522,26 @@ token, see "AuthN" above):
 ADMIN_TOKEN=$(dotnet run --project src/DevTools -- mint-token 00000000-0000-0000-0000-000000000000)
 
 # create a tenant, issue an API key, set a provider credential
-curl -X POST http://localhost:5299/tenants -H "Authorization: Bearer $ADMIN_TOKEN" -H "Content-Type: application/json" -d '{"name":"Acme"}'
-curl -X POST http://localhost:5299/tenants/<tenantId>/api-keys -H "Authorization: Bearer $ADMIN_TOKEN" -H "Content-Type: application/json" -d '{"name":"prod"}'
-curl -X PUT http://localhost:5299/tenants/<tenantId>/providers/openai -H "Authorization: Bearer $ADMIN_TOKEN" -H "Content-Type: application/json" -d '{"apiKey":"sk-..."}'
+curl -X POST http://localhost:5162/tenants -H "Authorization: Bearer $ADMIN_TOKEN" -H "Content-Type: application/json" -d '{"name":"Acme"}'
+curl -X POST http://localhost:5162/tenants/<tenantId>/api-keys -H "Authorization: Bearer $ADMIN_TOKEN" -H "Content-Type: application/json" -d '{"name":"prod"}'
+curl -X PUT http://localhost:5162/tenants/<tenantId>/providers/openai -H "Authorization: Bearer $ADMIN_TOKEN" -H "Content-Type: application/json" -d '{"apiKey":"sk-..."}'
+
+# optionally configure a token quota + quota-alert webhook (see "Quota alerting" above)
+curl -X PATCH http://localhost:5162/tenants/<tenantId> -H "Authorization: Bearer $ADMIN_TOKEN" -H "Content-Type: application/json" \
+  -d '{"tokenQuotaPerWindow":1000,"alertWebhookUrl":"https://example.com/hooks/quota","alertThresholdPercentages":[80,100]}'
 
 # call the data-plane — either the issued API key, or a JWT scoped to that tenant, both work
-curl -X POST http://localhost:5298/v1/chat/completions \
+curl -X POST http://localhost:5116/v1/chat/completions \
   -H "Authorization: Bearer <the key from api-keys response>" -H "Content-Type: application/json" \
   -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}'
 
 DATA_PLANE_TOKEN=$(dotnet run --project src/DevTools -- mint-token <tenantId>)
-curl -X POST http://localhost:5298/v1/chat/completions \
+curl -X POST http://localhost:5116/v1/chat/completions \
   -H "Authorization: Bearer $DATA_PLANE_TOKEN" -H "Content-Type: application/json" \
   -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}'
 
 # check what got recorded
-curl http://localhost:5299/tenants/<tenantId>/usage -H "Authorization: Bearer $ADMIN_TOKEN"
+curl http://localhost:5162/tenants/<tenantId>/usage -H "Authorization: Bearer $ADMIN_TOKEN"
 ```
 
 Both `Api` and `Management` default to `Secrets:Provider = "LocalDev"` in `appsettings.Development.json`, storing
@@ -480,7 +560,7 @@ so a token minted once works against either.
 With Postgres/Redis up and `Management` running (above), start the Dashboard from `src/Dashboard`:
 
 ```bash
-npm run dev   # http://localhost:5173, proxies /api/** to Management on :5299
+npm run dev   # http://localhost:5173, proxies /api/** to Management on :5162
 ```
 
 Open `http://localhost:5173` — it redirects to `/login`. Paste a JWT minted the same way as the `curl` walkthrough

@@ -15,9 +15,11 @@ public static class TenantsEndpoint
         return tenantsGroup;
     }
 
-    public sealed record CreateTenantRequest(string Name, int? TokenQuotaPerWindow = null);
+    public sealed record CreateTenantRequest(
+        string Name, int? TokenQuotaPerWindow = null, string? AlertWebhookUrl = null, int[]? AlertThresholdPercentages = null);
 
-    public sealed record UpdateTenantRequest(int? TokenQuotaPerWindow);
+    public sealed record UpdateTenantRequest(
+        int? TokenQuotaPerWindow, string? AlertWebhookUrl = null, int[]? AlertThresholdPercentages = null);
 
     private static async Task<IResult> CreateAsync(
         CreateTenantRequest request, GatewayDbContext dbContext, CancellationToken cancellationToken)
@@ -32,12 +34,19 @@ public static class TenantsEndpoint
             return Results.BadRequest(new { error = new { message = "tokenQuotaPerWindow must be non-negative." } });
         }
 
+        if (ValidateAlertFields(request.AlertWebhookUrl, request.AlertThresholdPercentages) is { } error)
+        {
+            return error;
+        }
+
         var tenant = new Tenant
         {
             Id = Guid.NewGuid(),
             Name = request.Name,
             CreatedAtUtc = DateTimeOffset.UtcNow,
             TokenQuotaPerWindow = request.TokenQuotaPerWindow,
+            AlertWebhookUrl = request.AlertWebhookUrl,
+            AlertThresholdPercentages = request.AlertThresholdPercentages,
         };
         dbContext.Tenants.Add(tenant);
         await dbContext.SaveChangesAsync(cancellationToken);
@@ -71,6 +80,11 @@ public static class TenantsEndpoint
             return Results.BadRequest(new { error = new { message = "tokenQuotaPerWindow must be non-negative." } });
         }
 
+        if (ValidateAlertFields(request.AlertWebhookUrl, request.AlertThresholdPercentages) is { } error)
+        {
+            return error;
+        }
+
         var tenant = await dbContext.Tenants.FirstOrDefaultAsync(t => t.Id == tenantId, cancellationToken);
         if (tenant is null)
         {
@@ -78,9 +92,29 @@ public static class TenantsEndpoint
         }
 
         tenant.TokenQuotaPerWindow = request.TokenQuotaPerWindow;
+        tenant.AlertWebhookUrl = request.AlertWebhookUrl;
+        tenant.AlertThresholdPercentages = request.AlertThresholdPercentages;
         await dbContext.SaveChangesAsync(cancellationToken);
 
         return Results.Ok(ToResponse(tenant));
+    }
+
+    /// <summary>Applied as given, same "not unset-means-don't-change" rule as <c>TokenQuotaPerWindow</c> —
+    /// a <c>PATCH</c> with both fields null clears alerting back to disabled.</summary>
+    private static IResult? ValidateAlertFields(string? webhookUrl, int[]? thresholdPercentages)
+    {
+        if (webhookUrl is { Length: > 0 } url
+            && (!Uri.TryCreate(url, UriKind.Absolute, out var parsed) || parsed.Scheme is not ("http" or "https")))
+        {
+            return Results.BadRequest(new { error = new { message = "alertWebhookUrl must be an absolute http(s) URL." } });
+        }
+
+        if (thresholdPercentages is { Length: > 0 } thresholds && thresholds.Any(t => t is < 1 or > 100))
+        {
+            return Results.BadRequest(new { error = new { message = "alertThresholdPercentages must each be between 1 and 100." } });
+        }
+
+        return null;
     }
 
     private static object ToResponse(Tenant tenant) => new
@@ -89,5 +123,7 @@ public static class TenantsEndpoint
         name = tenant.Name,
         createdAtUtc = tenant.CreatedAtUtc,
         tokenQuotaPerWindow = tenant.TokenQuotaPerWindow,
+        alertWebhookUrl = tenant.AlertWebhookUrl,
+        alertThresholdPercentages = tenant.AlertThresholdPercentages,
     };
 }

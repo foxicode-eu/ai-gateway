@@ -20,7 +20,7 @@ Single repo, multiple .NET/JS projects under `src/`, registered in `src/Gateway.
 - **`src/Management`** — control-plane REST API: tenant onboarding, API key issuance, provider credential
   management, usage queries, quota configuration. Consumed by the dashboard and usable directly by tenants.
 - **`src/Dashboard`** — React + TypeScript SPA (Vite) for tenant self-service (tenant/key/provider management,
-  usage charts; quota alerting UI is Phase 9). Talks only to `src/Management`, proxied same-origin in local dev
+  usage charts, quota-alert configuration). Talks only to `src/Management`, proxied same-origin in local dev
   (see CLAUDE.md). Stack: TanStack Router (code-based routing) + TanStack Query (server state) + shadcn/ui
   primitives on Tailwind CSS v4 + Recharts.
 - **`src/Core`** (shared .NET library) — tenant/domain model, provider client abstractions, rate-limit
@@ -163,8 +163,14 @@ infrastructure is "in place for it," not just planned.
 - Usage data feeds:
   - Per-tenant usage queries (`GET /tenants/{id}/usage` on `Management` — aggregate totals + a per-provider
     breakdown over a configurable time window), rendered as a bar chart in `Dashboard` (Recharts).
-  - Quota-threshold alerting (e.g. webhook/email when a tenant approaches its limit) — **not built yet**, that's
-    Phase 9.
+  - Quota-threshold alerting: opt-in per tenant (`Tenant.AlertWebhookUrl` + `Tenant.AlertThresholdPercentages`,
+    configured via `PATCH /tenants/{id}` and the Dashboard's quota card). `Api.Alerting.QuotaAlertGate` checks,
+    inline after every request records its usage, whether the tenant's estimated usage just crossed a configured
+    percentage of `TokenQuotaPerWindow` and POSTs a JSON payload to the webhook via `Core.Alerting.WebhookQuotaAlertSender`
+    if so — webhook-only for now (see the former open question below, now resolved). A misconfigured/unreachable
+    webhook is logged and swallowed, never surfaced to the tenant's chat-completion request. See CLAUDE.md's
+    "Quota alerting" section for the full design (anti-duplicate-per-window logic, highest-threshold-wins when
+    multiple are crossed at once).
 
 ## Deployment
 
@@ -184,7 +190,8 @@ infrastructure is "in place for it," not just planned.
 ## Open questions / not yet decided
 
 - Billing/invoicing integration (e.g. Stripe) if the gateway ever charges tenants a platform fee on top of BYOK.
-- Concrete alerting delivery mechanism (webhook vs. email vs. both) for quota-threshold notifications.
+- Email delivery for quota-threshold alerts — Phase 9 built webhook-only per explicit direction; email (or a
+  second delivery mechanism generally) is deferred, not ruled out.
 - When/whether to introduce schema- or database-per-tenant isolation for specific compliance-driven customers.
 - Pooled/gateway-owned provider key support (future reseller tier).
 - Production topology for `Dashboard` ↔ `Management`: local dev uses a same-origin Vite dev-server proxy (see

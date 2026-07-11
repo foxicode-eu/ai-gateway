@@ -40,6 +40,8 @@ export interface Tenant {
   name: string
   createdAtUtc: string
   tokenQuotaPerWindow: number | null
+  alertWebhookUrl: string | null
+  alertThresholdPercentages: number[] | null
 }
 
 export interface ApiKeySummary {
@@ -80,8 +82,16 @@ export const api = {
   getTenant: (tenantId: string) => request<Tenant>(`/tenants/${tenantId}`),
   createTenant: (name: string, tokenQuotaPerWindow: number | null) =>
     request<Tenant>('/tenants', { method: 'POST', body: JSON.stringify({ name, tokenQuotaPerWindow }) }),
-  updateTenant: (tenantId: string, tokenQuotaPerWindow: number | null) =>
-    request<Tenant>(`/tenants/${tenantId}`, { method: 'PATCH', body: JSON.stringify({ tokenQuotaPerWindow }) }),
+  updateTenant: (
+    tenantId: string,
+    tokenQuotaPerWindow: number | null,
+    alertWebhookUrl: string | null = null,
+    alertThresholdPercentages: number[] | null = null,
+  ) =>
+    request<Tenant>(`/tenants/${tenantId}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ tokenQuotaPerWindow, alertWebhookUrl, alertThresholdPercentages }),
+    }),
 
   listApiKeys: (tenantId: string) => request<ApiKeySummary[]>(`/tenants/${tenantId}/api-keys`),
   createApiKey: (tenantId: string, name: string, tokenQuotaPerWindow: number | null) =>

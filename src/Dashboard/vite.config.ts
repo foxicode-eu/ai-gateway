@@ -17,7 +17,7 @@ export default defineConfig({
     // fight in local dev. See CLAUDE.md's Dashboard section.
     proxy: {
       '/api': {
-        target: 'http://localhost:5299',
+        target: 'http://localhost:5162',
         changeOrigin: true,
         rewrite: (requestPath) => requestPath.replace(/^\/api/, ''),
       },

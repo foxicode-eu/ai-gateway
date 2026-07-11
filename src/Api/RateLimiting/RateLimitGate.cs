@@ -24,7 +24,7 @@ public sealed class RateLimitGate(ITokenRateLimiter rateLimiter, GatewayDbContex
 
         if (tenantQuota is int tenantLimit)
         {
-            var status = await rateLimiter.CheckAsync(TenantKey(tenantId), tenantLimit, window, cancellationToken);
+            var status = await rateLimiter.CheckAsync(RateLimitKeys.TenantKey(tenantId), tenantLimit, window, cancellationToken);
             if (!status.IsAllowed)
             {
                 return new RateLimitCheckResult(false, "tenant", tenantQuota, null);
@@ -42,7 +42,7 @@ public sealed class RateLimitGate(ITokenRateLimiter rateLimiter, GatewayDbContex
 
             if (apiKeyQuota is int keyLimit)
             {
-                var status = await rateLimiter.CheckAsync(ApiKeyKey(keyId), keyLimit, window, cancellationToken);
+                var status = await rateLimiter.CheckAsync(RateLimitKeys.ApiKeyKey(keyId), keyLimit, window, cancellationToken);
                 if (!status.IsAllowed)
                 {
                     return new RateLimitCheckResult(false, "api_key", tenantQuota, apiKeyQuota);
@@ -64,20 +64,16 @@ public sealed class RateLimitGate(ITokenRateLimiter rateLimiter, GatewayDbContex
 
         if (checkResult.TenantQuota.HasValue)
         {
-            await rateLimiter.RecordUsageAsync(TenantKey(tenantId), tokens, window, cancellationToken);
+            await rateLimiter.RecordUsageAsync(RateLimitKeys.TenantKey(tenantId), tokens, window, cancellationToken);
         }
 
         if (apiKeyId is { } keyId && checkResult.ApiKeyQuota.HasValue)
         {
-            await rateLimiter.RecordUsageAsync(ApiKeyKey(keyId), tokens, window, cancellationToken);
+            await rateLimiter.RecordUsageAsync(RateLimitKeys.ApiKeyKey(keyId), tokens, window, cancellationToken);
         }
     }
 
     private TimeSpan Window => TimeSpan.FromSeconds(options.Value.WindowSeconds);
-
-    private static string TenantKey(Guid tenantId) => $"ratelimit:tenant:{tenantId:N}";
-
-    private static string ApiKeyKey(Guid apiKeyId) => $"ratelimit:apikey:{apiKeyId:N}";
 }
 
 /// <param name="TenantQuota">The tenant's configured quota, if any — null means unlimited. Passed to

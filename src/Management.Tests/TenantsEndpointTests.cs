@@ -130,4 +130,57 @@ public class TenantsEndpointTests : IClassFixture<ManagementApiFactory>
         var zebraIndex = names.IndexOf("Zebra Corp");
         Assert.True(acmeIndex >= 0 && zebraIndex >= 0 && acmeIndex < zebraIndex);
     }
+
+    [Fact]
+    public async Task Configures_alert_webhook_and_thresholds_on_update_and_reads_them_back()
+    {
+        var createResponse = await _client.PostAsJsonAsync("/tenants", new TenantsEndpoint.CreateTenantRequest("Acme", TokenQuotaPerWindow: 1000));
+        var tenantId = (await createResponse.Content.ReadFromJsonAsync<JsonObject>())!["id"]!.GetValue<Guid>();
+
+        var patchResponse = await _client.PatchAsJsonAsync(
+            $"/tenants/{tenantId}",
+            new TenantsEndpoint.UpdateTenantRequest(1000, "https://example.com/hooks/quota", [80, 100]));
+
+        Assert.Equal(HttpStatusCode.OK, patchResponse.StatusCode);
+        var updated = await patchResponse.Content.ReadFromJsonAsync<JsonObject>();
+        Assert.Equal("https://example.com/hooks/quota", updated?["alertWebhookUrl"]?.GetValue<string>());
+        Assert.Equal([80, 100], updated?["alertThresholdPercentages"]?.AsArray().Select(v => v!.GetValue<int>()));
+
+        var getResponse = await _client.GetAsync($"/tenants/{tenantId}");
+        var fetched = await getResponse.Content.ReadFromJsonAsync<JsonObject>();
+        Assert.Equal("https://example.com/hooks/quota", fetched?["alertWebhookUrl"]?.GetValue<string>());
+    }
+
+    [Fact]
+    public async Task Rejects_a_non_absolute_alert_webhook_url()
+    {
+        var response = await _client.PostAsJsonAsync(
+            "/tenants", new TenantsEndpoint.CreateTenantRequest("Acme", AlertWebhookUrl: "not-a-url"));
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task Rejects_an_out_of_range_alert_threshold_percentage()
+    {
+        var response = await _client.PostAsJsonAsync(
+            "/tenants",
+            new TenantsEndpoint.CreateTenantRequest("Acme", AlertThresholdPercentages: [150]));
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task Can_clear_alerting_back_to_disabled()
+    {
+        var createResponse = await _client.PostAsJsonAsync(
+            "/tenants", new TenantsEndpoint.CreateTenantRequest("Acme", AlertWebhookUrl: "https://example.com/hooks/quota", AlertThresholdPercentages: [80]));
+        var tenantId = (await createResponse.Content.ReadFromJsonAsync<JsonObject>())!["id"]!.GetValue<Guid>();
+
+        var patchResponse = await _client.PatchAsJsonAsync($"/tenants/{tenantId}", new TenantsEndpoint.UpdateTenantRequest(null));
+
+        var updated = await patchResponse.Content.ReadFromJsonAsync<JsonObject>();
+        Assert.Null(updated?["alertWebhookUrl"]);
+        Assert.Null(updated?["alertThresholdPercentages"]);
+    }
 }

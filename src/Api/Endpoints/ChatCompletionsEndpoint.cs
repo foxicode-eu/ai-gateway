@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Text.Json.Nodes;
+using Api.Alerting;
 using Api.Authentication;
 using Api.Observability;
 using Api.RateLimiting;
@@ -57,6 +58,7 @@ public static class ChatCompletionsEndpoint
 
         var services = httpRequest.HttpContext.RequestServices;
         var rateLimitGate = services.GetRequiredService<RateLimitGate>();
+        var quotaAlertGate = services.GetRequiredService<QuotaAlertGate>();
         var usageRecorder = services.GetRequiredService<UsageEventRecorder>();
 
         var stopwatch = Stopwatch.StartNew();
@@ -104,6 +106,8 @@ public static class ChatCompletionsEndpoint
 
             await rateLimitGate.RecordUsageAsync(
                 tenantId, authenticated.ApiKeyId, rateLimitCheck, promptTokens + completionTokens, cancellationToken);
+
+            await quotaAlertGate.CheckAndAlertAsync(tenantId, rateLimitCheck.TenantQuota, cancellationToken);
 
             return result;
         }

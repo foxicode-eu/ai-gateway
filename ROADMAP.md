@@ -238,8 +238,41 @@ suite, and the production (non-local-dev) Dashboard↔Management CORS/cookie top
 choices not yet made.
 
 ## Phase 9 — Quota alerting
-- [ ] Threshold-based notifications (webhook/email — delivery mechanism still an open question in
-  `ARCHITECTURE.md`)
+- [x] Delivery mechanism and trigger design decided by explicit direction ahead of implementation: webhook-only
+  (email deferred, not ruled out), per-tenant configurable threshold percentages (not a fixed 80/100), checked
+  inline with the existing rate-limit-recording path on `Api` rather than a new background job.
+- [x] Schema: `Tenant.AlertWebhookUrl` (null = disabled) + `Tenant.AlertThresholdPercentages` (`int[]`,
+  Postgres native array column via a new `AddQuotaAlerting` EF Core migration), both settable via
+  `Management`'s `PATCH /tenants/{id}` (validated: absolute `http(s)` URL, thresholds `1`-`100`) and the
+  Dashboard's `QuotaCard` (extended into "Token quota & alerts", one form/one save so a plain quota edit can't
+  accidentally clear alerting under the existing "always applied as given" `PATCH` semantics).
+- [x] `Core/Alerting` (`IQuotaAlertSender`/`WebhookQuotaAlertSender` — POSTs a JSON payload, no `BaseAddress`
+  since webhook URLs are per-tenant/arbitrary) + `Api/Alerting/QuotaAlertGate` (the decision logic: re-checks
+  the tenant's usage via the *same* rate-limiter key `RateLimitGate` enforces admission with — extracted to
+  `Core.RateLimiting.RateLimitKeys` so the two call sites can't drift on the key format — fires the *highest*
+  crossed threshold if any, tracks "already alerted this window" in the same rate-limit store under an
+  `alert:tenant:{id}:{windowIndex}` key via an increment-only "raise to at least X" trick, since
+  `IRateLimitStore` has no direct "set"). Wired into `ChatCompletionsEndpoint`'s `FinishAsync` right after
+  `RateLimitGate.RecordUsageAsync`, on every exit path. A webhook delivery failure is logged and swallowed —
+  never breaks the chat-completion request that triggered the check.
+- [x] Test coverage: 11 new backend tests (136 total) — `Core.Tests` covers `WebhookQuotaAlertSender` (fake
+  `HttpMessageHandler`, payload shape + non-2xx-throws); `Api.Tests` covers the full alerting decision matrix
+  (fires on crossing, doesn't fire below threshold, doesn't re-fire the same threshold twice in one window,
+  fires again for a higher threshold, never fires with no webhook configured) via a stub `IQuotaAlertSender`;
+  `Management.Tests` covers `PATCH` validation and round-tripping of the new tenant fields, including clearing
+  alerting back to disabled.
+- [x] Verified live against real Redis and a real HTTP webhook receiver: created a tenant via `Management` with
+  a 100-token quota and thresholds `[50, 90]` pointed at a local webhook receiver; seeded the tenant's real
+  rate-limit Redis counter (same technique as Phase 6's live verification) to simulate usage, then sent a real
+  chat-completion request through `Api` — confirmed the receiver got a real chunked-encoding HTTP POST with the
+  exact expected JSON payload. Confirmed crossing two thresholds in a single check fires only the higher one
+  (not both), that a second request within the same window doesn't re-fire, and — observed incidentally via
+  real outbound-network latency pushing a follow-up request into the next window — that a new window correctly
+  resets and re-alerts.
+- [x] Live testing also caught and fixed a real, unrelated latent bug: `Dashboard`'s `vite.config.ts` dev proxy
+  target was `http://localhost:5299`, but `Management`'s actual dev port (`launchSettings.json`) is `5162` —
+  the Dashboard would have 404'd on every API call in local dev. `CLAUDE.md`'s own command walkthroughs had the
+  same stale `5299`/`5298` typo, copy-pasted from the wrong source; both fixed.
 
 ## Phase 10 — Deployment hardening & follow-ons
 - [ ] Azure Container Apps deployment, managed Postgres + Redis
