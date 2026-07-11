@@ -129,4 +129,31 @@ public class ApiKeysEndpointTests : IClassFixture<ManagementApiFactory>
 
         Assert.Equal(HttpStatusCode.NotFound, patchResponse.StatusCode);
     }
+
+    [Fact]
+    public async Task Lists_keys_for_a_tenant_without_exposing_the_hash_or_plaintext()
+    {
+        var tenantId = await CreateTenantAsync("Acme");
+        await _client.PostAsJsonAsync($"/tenants/{tenantId}/api-keys", new ApiKeysEndpoint.CreateApiKeyRequest("prod"));
+        await _client.PostAsJsonAsync($"/tenants/{tenantId}/api-keys", new ApiKeysEndpoint.CreateApiKeyRequest("staging"));
+
+        var response = await _client.GetAsync($"/tenants/{tenantId}/api-keys");
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        var keys = await response.Content.ReadFromJsonAsync<JsonArray>();
+        Assert.Equal(2, keys!.Count);
+        var names = keys.Select(k => k!["name"]!.GetValue<string>()).ToList();
+        Assert.Contains("prod", names);
+        Assert.Contains("staging", names);
+        Assert.All(keys, k => Assert.Null(k!["key"]));
+        Assert.All(keys, k => Assert.Null(k!["keyHash"]));
+    }
+
+    [Fact]
+    public async Task Returns_404_when_listing_keys_for_an_unknown_tenant()
+    {
+        var response = await _client.GetAsync($"/tenants/{Guid.NewGuid()}/api-keys");
+
+        Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
+    }
 }

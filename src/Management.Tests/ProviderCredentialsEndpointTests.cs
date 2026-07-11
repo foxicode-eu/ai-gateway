@@ -71,4 +71,28 @@ public class ProviderCredentialsEndpointTests : IClassFixture<ManagementApiFacto
 
         Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
     }
+
+    [Fact]
+    public async Task Lists_known_providers_with_configured_status_but_never_the_secret_value()
+    {
+        var tenantId = await CreateTenantAsync("Acme");
+        await _client.PutAsJsonAsync(
+            $"/tenants/{tenantId}/providers/openai", new ProviderCredentialsEndpoint.SetProviderCredentialRequest("sk-openai-test"));
+
+        var response = await _client.GetAsync($"/tenants/{tenantId}/providers");
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        var providers = await response.Content.ReadFromJsonAsync<JsonArray>();
+        Assert.Contains(providers!, p => p!["provider"]!.GetValue<string>() == "openai" && p["configured"]!.GetValue<bool>());
+        Assert.Contains(providers!, p => p!["provider"]!.GetValue<string>() == "anthropic" && !p["configured"]!.GetValue<bool>());
+        Assert.All(providers!, p => Assert.Null(p!["apiKey"]));
+    }
+
+    [Fact]
+    public async Task Returns_404_when_listing_providers_for_an_unknown_tenant()
+    {
+        var response = await _client.GetAsync($"/tenants/{Guid.NewGuid()}/providers");
+
+        Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
+    }
 }

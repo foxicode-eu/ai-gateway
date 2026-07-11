@@ -19,8 +19,10 @@ Single repo, multiple .NET/JS projects under `src/`, registered in `src/Gateway.
   (`/v1/chat/completions`, `/v1/completions`, `/v1/models`, ...). Optimized for latency; this is the hot path.
 - **`src/Management`** — control-plane REST API: tenant onboarding, API key issuance, provider credential
   management, usage queries, quota configuration. Consumed by the dashboard and usable directly by tenants.
-- **`src/Dashboard`** — React + TypeScript SPA for tenant self-service (onboarding, key management, usage
-  charts, quota alerts). Talks only to `src/Management`.
+- **`src/Dashboard`** — React + TypeScript SPA (Vite) for tenant self-service (tenant/key/provider management,
+  usage charts; quota alerting UI is Phase 9). Talks only to `src/Management`, proxied same-origin in local dev
+  (see CLAUDE.md). Stack: TanStack Router (code-based routing) + TanStack Query (server state) + shadcn/ui
+  primitives on Tailwind CSS v4 + Recharts.
 - **`src/Core`** (shared .NET library) — tenant/domain model, provider client abstractions, rate-limit
   primitives, usage-event schema. Referenced by both `Api` and `Management` so the data-plane and control-plane
   agree on tenant/quota semantics without duplicating logic.
@@ -46,7 +48,12 @@ if a specific enterprise/compliance customer requires it — don't build that is
   tokens scoped to a tenant and an API key. The API key identity is what rate limits and usage attribution key
   off (see below).
 - **Control-plane (`Management`)**: tenant admin users authenticate via OIDC/SSO through the same IdP; dashboard
-  sessions use standard authorization-code + PKCE flow.
+  sessions use standard authorization-code + PKCE flow. The `Dashboard` browser session itself is **server-side,
+  cookie-based** — the browser is only ever handed an opaque, HttpOnly session ID, never the underlying JWT/IdP
+  tokens. This is a deliberate choice (over, say, storing a JWT in the SPA and sending it as a bearer token)
+  specifically to minimize token exposure to client-side JS/XSS: the actual credential never leaves the server,
+  and a session can be revoked server-side without needing token blocklisting. See "Session infrastructure"
+  below for how this is implemented and why it's already real infra, not a placeholder.
 
 **Implementation status**: `Core/Auth` provides a generic, IdP-agnostic JWT bearer validator
 (`IJwtAccessTokenValidator`) driven by `Authentication:Authority`/`Authentication:Audience` config — this works
@@ -68,6 +75,23 @@ Local development and tests use a "StaticKey" mode (`LocalDevTokenIssuer` in `Co
 CLI project) that mints tokens signed with a locally-configured symmetric key instead of a real IdP — this is
 explicitly test/dev-only and is never how a real credential should be minted; the running gateway processes
 never expose a token-issuing HTTP endpoint.
+
+### Session infrastructure (Management + Dashboard)
+
+`Management` exchanges a bearer JWT (validated through the same `IJwtAccessTokenValidator` described above —
+today that's a `DevTools`-minted token, later a real IdP-issued one, with no change needed on this side of the
+exchange) for a server-side session via `POST /auth/login`. The session itself lives in `Core/Sessions`
+(`ISessionStore`, Redis-backed in production / in-memory for local dev and tests — the same provider-swap
+pattern as `Secrets`/`RateLimiting`/`Observability`), keyed by a random opaque ID that's the *only* thing the
+`Set-Cookie` response carries (`HttpOnly`, `SameSite=Lax`, `Secure` in non-dev environments). `Management`'s
+existing bearer-JWT auth path (from Phase 4) is kept working alongside the cookie — `AdminAuthenticationFilter`
+accepts either, so the `curl`/`DevTools` automation flow documented in CLAUDE.md doesn't need a session at all,
+while the `Dashboard` always uses the cookie.
+
+Swapping in a real IdP later only changes how the *Dashboard* obtains the JWT to exchange (an OIDC
+authorization-code+PKCE redirect instead of a paste-a-token login form) — the exchange endpoint, the session
+store, the cookie, and `AdminAuthenticationFilter` don't need to change. That's the concrete sense in which this
+infrastructure is "in place for it," not just planned.
 
 ## Provider integration
 
@@ -138,8 +162,7 @@ never expose a token-issuing HTTP endpoint.
   Metadata only, same rule as above.
 - Usage data feeds:
   - Per-tenant usage queries (`GET /tenants/{id}/usage` on `Management` — aggregate totals + a per-provider
-    breakdown over a configurable time window). Not yet rendered anywhere (`Dashboard` doesn't exist yet — see
-    its own phase); this is the API a future dashboard would call.
+    breakdown over a configurable time window), rendered as a bar chart in `Dashboard` (Recharts).
   - Quota-threshold alerting (e.g. webhook/email when a tenant approaches its limit) — **not built yet**, that's
     Phase 9.
 
@@ -153,6 +176,10 @@ never expose a token-issuing HTTP endpoint.
 
 - **xUnit** for all .NET test projects.
 - **GitHub Actions** runs build + test (and later lint) on PRs.
+- `Dashboard` has no automated test suite yet (no Vitest/RTL/Playwright wired into `npm test` or CI) — it's
+  been verified manually via a real headless-browser session (Playwright, driven ad hoc, not committed as a
+  repeatable test) each time it's changed so far. Worth adding proper component/e2e coverage before the
+  Dashboard grows much further; tracked as a gap, not a decision.
 
 ## Open questions / not yet decided
 
@@ -160,6 +187,11 @@ never expose a token-issuing HTTP endpoint.
 - Concrete alerting delivery mechanism (webhook vs. email vs. both) for quota-threshold notifications.
 - When/whether to introduce schema- or database-per-tenant isolation for specific compliance-driven customers.
 - Pooled/gateway-owned provider key support (future reseller tier).
+- Production topology for `Dashboard` ↔ `Management`: local dev uses a same-origin Vite dev-server proxy (see
+  CLAUDE.md), sidestepping CORS/cookie cross-origin rules entirely. A real deployment needs an equivalent
+  same-origin arrangement (reverse proxy, or serve both from the same domain) or a properly configured
+  `Cors:AllowedOrigins` + `SameSite=None; Secure` cross-origin cookie setup — not decided which, since it
+  depends on the eventual hosting topology (Deployment section above is also not decided in enough detail yet).
 - Which managed IdP to actually use (Entra ID external tenants vs. Auth0 vs. other) — blocked on having a real
   account to build/verify dynamic per-tenant client registration against; the JWT *validation* side is IdP-agnostic
   and already built (see AuthN/AuthZ above), but nothing has exercised real OIDC discovery against a live IdP.

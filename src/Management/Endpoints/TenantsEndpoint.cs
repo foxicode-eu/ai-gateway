@@ -9,6 +9,7 @@ public static class TenantsEndpoint
     public static IEndpointRouteBuilder MapTenants(this IEndpointRouteBuilder tenantsGroup)
     {
         tenantsGroup.MapPost("", CreateAsync);
+        tenantsGroup.MapGet("", ListAsync);
         tenantsGroup.MapGet("/{tenantId:guid}", GetAsync);
         tenantsGroup.MapPatch("/{tenantId:guid}", UpdateAsync);
         return tenantsGroup;
@@ -42,6 +43,16 @@ public static class TenantsEndpoint
         await dbContext.SaveChangesAsync(cancellationToken);
 
         return Results.Created($"/tenants/{tenant.Id}", ToResponse(tenant));
+    }
+
+    private static async Task<IResult> ListAsync(GatewayDbContext dbContext, CancellationToken cancellationToken)
+    {
+        var tenants = await dbContext.Tenants
+            .OrderBy(t => t.Name)
+            .Select(t => new { id = t.Id, name = t.Name, createdAtUtc = t.CreatedAtUtc, tokenQuotaPerWindow = t.TokenQuotaPerWindow })
+            .ToListAsync(cancellationToken);
+
+        return Results.Ok(tenants);
     }
 
     private static async Task<IResult> GetAsync(

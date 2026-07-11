@@ -10,6 +10,7 @@ public static class ApiKeysEndpoint
     public static IEndpointRouteBuilder MapApiKeys(this IEndpointRouteBuilder tenantsGroup)
     {
         tenantsGroup.MapPost("/{tenantId:guid}/api-keys", CreateAsync);
+        tenantsGroup.MapGet("/{tenantId:guid}/api-keys", ListAsync);
         tenantsGroup.MapDelete("/{tenantId:guid}/api-keys/{apiKeyId:guid}", RevokeAsync);
         tenantsGroup.MapPatch("/{tenantId:guid}/api-keys/{apiKeyId:guid}", UpdateAsync);
         return tenantsGroup;
@@ -62,6 +63,32 @@ public static class ApiKeysEndpoint
                 createdAtUtc = apiKey.CreatedAtUtc,
                 tokenQuotaPerWindow = apiKey.TokenQuotaPerWindow,
             });
+    }
+
+    private static async Task<IResult> ListAsync(
+        Guid tenantId, GatewayDbContext dbContext, CancellationToken cancellationToken)
+    {
+        var tenantExists = await dbContext.Tenants.AnyAsync(t => t.Id == tenantId, cancellationToken);
+        if (!tenantExists)
+        {
+            return Results.NotFound(new { error = new { message = "Tenant not found." } });
+        }
+
+        // Never the hash or plaintext — this is a management listing, not a credential export.
+        var apiKeys = await dbContext.ApiKeys
+            .Where(k => k.TenantId == tenantId)
+            .OrderBy(k => k.Name)
+            .Select(k => new
+            {
+                id = k.Id,
+                name = k.Name,
+                createdAtUtc = k.CreatedAtUtc,
+                revokedAtUtc = k.RevokedAtUtc,
+                tokenQuotaPerWindow = k.TokenQuotaPerWindow,
+            })
+            .ToListAsync(cancellationToken);
+
+        return Results.Ok(apiKeys);
     }
 
     private static async Task<IResult> RevokeAsync(

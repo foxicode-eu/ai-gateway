@@ -195,8 +195,47 @@ Not built (explicitly out of scope for this phase, tracked in `ARCHITECTURE.md`)
 alerting (that's Phase 9).
 
 ## Phase 8 — Dashboard
-- [ ] `Dashboard` SPA wired to `Management` API: tenant onboarding, API key management
-- [ ] Usage charts from Phase 7 data
+- [x] Session-based auth infrastructure for `Management` + `Dashboard`, chosen (per explicit direction, ahead of
+  the rest of this phase's design) specifically to reduce token-leakage exposure in the browser versus storing a
+  JWT client-side: `Core/Sessions` (`ISessionStore`, `RedisSessionStore`/`InMemorySessionStore` — same
+  provider-swap pattern as `Secrets`/`RateLimiting`), `Management/Authentication/SessionCookies`
+  (HttpOnly/SameSite=Lax opaque session cookie, server-side revocable), `POST /auth/login|logout`,
+  `GET /auth/session` (`Endpoints/AuthEndpoint.cs`). `AdminAuthenticationFilter` now accepts either a session
+  cookie or the existing bearer JWT — deliberate dual scheme, Dashboard uses the former, `curl`/`DevTools`/
+  automation keep using the latter. The credential exchanged at `/auth/login` is still a `DevTools`-minted dev
+  JWT for now, but the exchange is structured so a real IdP login flow can be swapped in later without touching
+  `SessionCookies` or the store.
+- [x] Three new `GET` list endpoints the Dashboard needed and `Management` didn't have yet: `GET /tenants`,
+  `GET /tenants/{id}/api-keys` (never the hash/plaintext), `GET /tenants/{id}/providers` (configured-status only,
+  never the credential value)
+- [x] `Dashboard` SPA wired to `Management` API: tenant onboarding, API key management. Stack chosen by explicit
+  user direction: TanStack Router (code-based routes) + TanStack Query + shadcn/ui + Tailwind CSS v4 + Recharts.
+  Vite dev-server proxy makes Dashboard↔Management same-origin locally, sidestepping cross-origin cookie
+  complexity. Pages: login, tenant list (+ create-tenant dialog), tenant detail (quota, API keys, provider
+  credentials, usage chart cards).
+- [x] Usage charts from Phase 7 data (`UsageCard.tsx`, Recharts bar chart of the `Management` usage endpoint's
+  per-provider breakdown)
+- [x] Test coverage: 14 new backend tests (125 total) — `Core.Tests` covers `InMemorySessionStore`
+  (round-trip/unknown/removal/expiry), `Management.Tests` adds `AuthEndpointTests` (full session lifecycle:
+  login sets a working cookie, invalid token rejected with no cookie, logout invalidates, `GET /auth/session`
+  reflects state, bearer-JWT path still works without a cookie) and a list-endpoint test per new `GET` route.
+  `Dashboard` has no automated test suite yet (open item in `ARCHITECTURE.md`) — verified via `npm run build`/
+  `npm run lint` plus live browser driving instead.
+- [x] Verified live: backend session flow against real Redis via `docker compose` (`Set-Cookie` on login,
+  `redis-cli KEYS 'session:*'` shows the real key, request without cookie → `401`, with cookie → succeeds,
+  logout → `204` and the Redis key is gone). Dashboard verified with a real headless-browser session (Playwright,
+  `chromium-cli` unavailable in this environment) driving the actual UI: login → tenant list → create tenant →
+  tenant detail → issue API key → set a provider credential → usage chart renders with real data from a prior
+  phase's verification run. This surfaced a real bug no unit/integration test caught: `LoginPage`'s
+  `queryClient.setQueryData` write on login success doesn't synchronously flush a re-render before an immediately
+  following `navigate()` call, so the newly-mounted `/` route's `RequireAuth` briefly saw stale
+  `isAuthenticated: false` and bounced back to `/login` even though login had actually succeeded. Fixed by
+  replacing the imperative post-login `navigate()` with a `useEffect` that navigates once `isAuthenticated`
+  reactively flips true — see `CLAUDE.md`'s "Sessions" section for detail.
+
+Not built (explicitly out of scope for this phase, tracked in `ARCHITECTURE.md`): an automated Dashboard test
+suite, and the production (non-local-dev) Dashboard↔Management CORS/cookie topology, which depends on hosting
+choices not yet made.
 
 ## Phase 9 — Quota alerting
 - [ ] Threshold-based notifications (webhook/email — delivery mechanism still an open question in

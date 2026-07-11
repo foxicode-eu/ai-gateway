@@ -3,6 +3,7 @@ using System.Security.Cryptography;
 using Core.Auth;
 using Core.Persistence;
 using Core.Secrets;
+using Core.Sessions;
 using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
@@ -44,6 +45,10 @@ public sealed class ManagementApiFactory : WebApplicationFactory<Program>
 
             services.RemoveAll<ISecretStore>();
             services.AddSingleton<ISecretStore>(SecretStore);
+
+            services.RemoveAll<ISessionStore>();
+            services.AddSingleton(TimeProvider.System);
+            services.AddSingleton<ISessionStore, InMemorySessionStore>();
 
             services.Configure<AuthenticationOptions>(o =>
             {

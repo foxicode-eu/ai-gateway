@@ -114,4 +114,20 @@ public class TenantsEndpointTests : IClassFixture<ManagementApiFactory>
 
         Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
     }
+
+    [Fact]
+    public async Task Lists_tenants_ordered_by_name()
+    {
+        await _client.PostAsJsonAsync("/tenants", new TenantsEndpoint.CreateTenantRequest("Zebra Corp"));
+        await _client.PostAsJsonAsync("/tenants", new TenantsEndpoint.CreateTenantRequest("Acme Corp"));
+
+        var response = await _client.GetAsync("/tenants");
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        var tenants = await response.Content.ReadFromJsonAsync<JsonArray>();
+        var names = tenants!.Select(t => t!["name"]!.GetValue<string>()).ToList();
+        var acmeIndex = names.IndexOf("Acme Corp");
+        var zebraIndex = names.IndexOf("Zebra Corp");
+        Assert.True(acmeIndex >= 0 && zebraIndex >= 0 && acmeIndex < zebraIndex);
+    }
 }

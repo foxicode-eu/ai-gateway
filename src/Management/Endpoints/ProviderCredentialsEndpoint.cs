@@ -10,6 +10,7 @@ public static class ProviderCredentialsEndpoint
     public static IEndpointRouteBuilder MapProviderCredentials(this IEndpointRouteBuilder tenantsGroup)
     {
         tenantsGroup.MapPut("/{tenantId:guid}/providers/{providerName}", SetAsync);
+        tenantsGroup.MapGet("/{tenantId:guid}/providers", ListAsync);
         return tenantsGroup;
     }
 
@@ -48,5 +49,30 @@ public static class ProviderCredentialsEndpoint
             ProviderCredentialSecretName.For(tenantId, providerName), request.ApiKey, cancellationToken);
 
         return Results.NoContent();
+    }
+
+    /// <summary>Never returns the credential value itself — only whether one is configured per known provider.</summary>
+    private static async Task<IResult> ListAsync(
+        Guid tenantId,
+        GatewayDbContext dbContext,
+        ISecretStore secretStore,
+        IEnumerable<IProviderClient> providerClients,
+        CancellationToken cancellationToken)
+    {
+        var tenantExists = await dbContext.Tenants.AnyAsync(t => t.Id == tenantId, cancellationToken);
+        if (!tenantExists)
+        {
+            return Results.NotFound(new { error = new { message = "Tenant not found." } });
+        }
+
+        var results = new List<object>();
+        foreach (var providerName in providerClients.Select(c => c.ProviderName).OrderBy(n => n))
+        {
+            var secret = await secretStore.GetSecretAsync(
+                ProviderCredentialSecretName.For(tenantId, providerName), cancellationToken);
+            results.Add(new { provider = providerName, configured = secret is not null });
+        }
+
+        return Results.Ok(results);
     }
 }

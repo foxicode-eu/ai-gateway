@@ -16,11 +16,12 @@ out of order. Read both before making structural decisions (new projects, auth f
 
 ## Current state
 
-Phases 0–7 are done (solution scaffolding, core domain + persistence, walking-skeleton proxy, multi-tenancy +
-BYOK credentials, JWT/managed-IdP auth, streaming, rate limiting, observability + usage data) — see
+Phases 0–8 are done (solution scaffolding, core domain + persistence, walking-skeleton proxy, multi-tenancy +
+BYOK credentials, JWT/managed-IdP auth, streaming, rate limiting, observability + usage data, Dashboard) — see
 `ROADMAP.md` for what's next. `Api` accepts both a JWT and a legacy hashed API key (see "AuthN" below — this is
-a deliberate, temporary dual-scheme, not an oversight). Check `ROADMAP.md` before starting new work so you're
-building the current phase, not a later one out of order, and update it as phases complete. Update
+a deliberate, temporary dual-scheme, not an oversight). `Management` accepts both a session cookie and a bearer
+JWT — same deliberate dual-scheme idea, see "Sessions" below. Check `ROADMAP.md` before starting new work so
+you're building the current phase, not a later one out of order, and update it as phases complete. Update
 `ARCHITECTURE.md` too if you make a decision that resolves one of its "Open questions".
 
 ## Solution structure
@@ -51,27 +52,35 @@ nullable reference types and implicit usings enabled.
     see "Observability & usage data" below — so those four things can't drift out of sync with each other.
 - `src/Management/` — ASP.NET Core Web API (`Microsoft.NET.Sdk.Web`), the control-plane API. References `Core`,
   wired the same way as `Api` (persistence, providers, secrets, `AddManagedIdentityAuthentication` — no
-  `AddApiKeyAuthentication` or rate limiting; Management doesn't proxy chat requests). Every request runs
-  `TenantScope.Unscoped` (set by middleware in `Program.cs`) — Management is the trusted control plane and
-  operates across tenants by design. All `/tenants/**` routes are grouped (`app.MapGroup("/tenants")` in
-  `Program.cs`) and require a valid JWT via `.AddEndpointFilter<AdminAuthenticationFilter>()`
-  (`Authentication/AdminAuthenticationFilter.cs`) — **any** valid token is trusted as a superadmin able to
-  operate on any tenant; there's no per-tenant admin restriction yet (open item in `ARCHITECTURE.md`). `/healthz`
-  is outside the group and stays unauthenticated. Endpoints (all under `Endpoints/`, registered with paths
-  *relative* to the `/tenants` group — e.g. `""` for the group root, `/{tenantId:guid}` for a specific tenant):
-  - `POST /tenants`, `GET /tenants/{tenantId}`, `PATCH /tenants/{tenantId}` — tenant CRUD (no delete). Create
-    and patch both accept an optional `tokenQuotaPerWindow` (null = unlimited; `PATCH` with `null` clears it
-    back to unlimited — it's not "unset means don't change", the field is always applied as given).
-  - `POST /tenants/{tenantId}/api-keys`, `PATCH /tenants/{tenantId}/api-keys/{apiKeyId}` — issues a key (the
-    plaintext is only ever in the create response — `ApiKeyGenerator.GenerateSecret()`/`.Hash()` in
-    `Core/Security`, the DB stores only the hash) and updates its own optional `tokenQuotaPerWindow`.
+  `AddApiKeyAuthentication` or rate limiting; Management doesn't proxy chat requests), plus session support via
+  `AddGatewaySessions` + a scoped `SessionCookies`, plus CORS (`AddCors`, policy name `"Dashboard"` — empty
+  `Cors:AllowedOrigins` by default, since local dev doesn't need it at all; see "Sessions" below). Every request
+  runs `TenantScope.Unscoped` (set by middleware in `Program.cs`) — Management is the trusted control plane and
+  operates across tenants by design. `POST /auth/login`, `POST /auth/logout`, `GET /auth/session`
+  (`Endpoints/AuthEndpoint.cs`) are unauthenticated (that's what gets you authenticated — see "Sessions" below).
+  All `/tenants/**` routes are grouped (`app.MapGroup("/tenants")` in `Program.cs`) and require either a valid
+  session cookie or a bearer JWT via `.AddEndpointFilter<AdminAuthenticationFilter>()`
+  (`Authentication/AdminAuthenticationFilter.cs`) — **any** authenticated caller is trusted as a superadmin able
+  to operate on any tenant; there's no per-tenant admin restriction yet (open item in `ARCHITECTURE.md`).
+  `/healthz` is outside the group and stays unauthenticated. Endpoints under `/tenants` (all in `Endpoints/`,
+  registered with paths *relative* to the group — e.g. `""` for the group root, `/{tenantId:guid}` for a
+  specific tenant):
+  - `POST /tenants`, `GET /tenants` (list, ordered by name), `GET /tenants/{tenantId}`, `PATCH /tenants/{tenantId}`
+    — tenant CRUD (no delete). Create and patch both accept an optional `tokenQuotaPerWindow` (null = unlimited;
+    `PATCH` with `null` clears it back to unlimited — it's not "unset means don't change", the field is always
+    applied as given).
+  - `POST /tenants/{tenantId}/api-keys`, `GET /tenants/{tenantId}/api-keys` (list — never the hash or plaintext),
+    `PATCH /tenants/{tenantId}/api-keys/{apiKeyId}` — issues a key (the plaintext is only ever in the create
+    response — `ApiKeyGenerator.GenerateSecret()`/`.Hash()` in `Core/Security`, the DB stores only the hash) and
+    updates its own optional `tokenQuotaPerWindow`.
   - `DELETE /tenants/{tenantId}/api-keys/{apiKeyId}` — revokes (soft: sets `RevokedAtUtc`).
   - `PUT /tenants/{tenantId}/providers/{providerName}` — stores a tenant's BYOK credential for that provider via
     `ISecretStore`, keyed by `ProviderCredentialSecretName.For(tenantId, providerName)`.
+  - `GET /tenants/{tenantId}/providers` — lists every known provider with a `configured: bool` — **never** the
+    credential value itself, that's write-only through this API.
   - `GET /tenants/{tenantId}/usage?sinceHours=<n>` (default 24) — aggregate usage over the window: total
     requests/tokens/errors plus a per-provider breakdown. Reads `UsageEvent` rows `Api` writes — see
-    "Observability & usage data" below. Nothing renders this yet (`Dashboard` doesn't exist); it's the API a
-    future dashboard would call.
+    "Observability & usage data" below. Rendered by `Dashboard`'s usage chart.
 - `src/DevTools/` — a small console app, **local development only**. `dotnet run --project src/DevTools --
   mint-token <tenant-id-guid>` mints a JWT signed with the same `Authentication:StaticKey` config `Api`/
   `Management` use, for manually testing authenticated `curl` requests. Deliberately not an HTTP endpoint on the
@@ -91,6 +100,7 @@ nullable reference types and implicit usings enabled.
     null = unlimited), `UsageEvent` (see "Observability & usage data" below).
   - `RateLimiting/` — see the dedicated "Rate limiting" section below.
   - `Observability/` — see the dedicated "Observability & usage data" section below.
+  - `Sessions/` — see the dedicated "Sessions" section below.
   - `Persistence/` — `GatewayDbContext` (EF Core + Npgsql), `GatewayDbContextFactory` (design-time factory for
     `dotnet ef` tooling), `ServiceCollectionExtensions.AddGatewayPersistence` (DI registration), and
     `Migrations/` (EF Core migrations — commit these, don't hand-edit generated migration files).
@@ -176,6 +186,57 @@ nullable reference types and implicit usings enabled.
   `RateLimitGate.RecordUsageAsync` (see "Rate limiting" below). There's still no usage-metrics consumer beyond
   rate limiting (that's Phase 7).
 
+### Sessions
+
+The Dashboard authenticates to `Management` with a server-side session, not a JWT stored in the browser — a
+deliberate choice to reduce token-leakage surface on the client (the user's explicit direction for this phase).
+`Core/Sessions`: `ISessionStore` (`SetAsync`/`GetAsync`/`RemoveAsync`, keyed by opaque session ID) with two
+implementations selected by `Sessions:Store` config via `AddGatewaySessions` — same provider-swap pattern as
+`Secrets`/`RateLimiting`:
+- `RedisSessionStore` ("Redis") — production/local-dev path, keys `session:{sessionId}`.
+- `InMemorySessionStore` ("InMemory") — `ConcurrentDictionary`, dev/test-only, takes `TimeProvider` for
+  deterministic expiry tests.
+
+`GatewaySessionOptions` (config key `Sessions`) — **named `Gateway`-prefixed, not just `SessionOptions`**,
+because `SessionOptions` collides with an ASP.NET Core built-in type that's implicitly in scope via global
+usings in a `Microsoft.NET.Sdk.Web` project (`CS0104` ambiguous reference — hit this for real, keep the prefix).
+Fields: `Store`, `RedisConnectionString`, `IdleTimeoutMinutes` (default 480), `CookieName` (default
+`ai_gateway_session`), `CookieSecure` (default `true` — set `false` in local dev over plain HTTP).
+
+`Management/Authentication/SessionCookies.cs` is the piece that actually touches `HttpContext`:
+`SignInAsync` generates a 32-byte random session ID (`RandomNumberGenerator`), stores the subject in
+`ISessionStore`, and appends the cookie (`HttpOnly=true`, `SameSite=Lax`, `Secure` from options). `SignOutAsync`
+removes the store entry and deletes the cookie. `IsValidAsync` reads the cookie and checks the store. Stealing
+the cookie alone isn't enough to forge a session (there's no signed payload to replay) and a session is
+server-side revocable — both properties a bare JWT-in-cookie wouldn't have.
+
+`AdminAuthenticationFilter` checks the session cookie first, falling back to the existing bearer-JWT path
+(`IJwtAccessTokenValidator`) if there's no valid session — this dual scheme is intentional, not a leftover: the
+Dashboard uses the session, `curl`/`DevTools`/automation keep using bearer JWTs. `Endpoints/AuthEndpoint.cs`
+(`POST /auth/login` — exchanges a JWT for a session cookie, `POST /auth/logout`, `GET /auth/session`) is the
+only unauthenticated surface on `Management`, by necessity. For now the credential exchanged at `/auth/login`
+is still a `DevTools`-minted JWT (`"StaticKey"` mode); the point of building it as a token-exchange rather than
+hardcoding a login form against `LocalDevTokenIssuer` is that swapping in a real IdP later (OIDC login flow →
+callback → exchange the IdP's token for a session the same way) doesn't require touching `SessionCookies` or
+the session store at all.
+
+CORS (`Management/Program.cs`, `AddCors` policy `"Dashboard"`) is wired but `Cors:AllowedOrigins` is empty by
+default — local dev doesn't need it because the Vite dev server proxies `/api/**` to `Management`, making
+Dashboard↔Management same-origin and sidestepping `SameSite=None`/`Secure`-over-HTTP cookie complexity
+entirely. Production topology (same-origin via a reverse proxy vs. cross-origin requiring `Secure`+`SameSite=None`
+cookies and a real `AllowedOrigins` list) is an open question — see `ARCHITECTURE.md`.
+
+**Real bug found via live browser testing, not caught by any unit/integration test:** `LoginPage.tsx`'s login
+mutation calls `queryClient.setQueryData(['session'], {authenticated: true})` in `onSuccess`, then originally
+called `navigate({to: '/'})` right after `login()` resolved. But that query-cache write doesn't synchronously
+flush a re-render before the subsequent `navigate()` call lands — `RequireAuth` on the newly-mounted `/` route
+observed the *stale* `isAuthenticated: false` and immediately bounced back to `/login`, even though the login
+itself had fully succeeded (cookie set, session in Redis). Fix: `LoginPage` no longer navigates imperatively;
+it has a `useEffect` that navigates to `/` only when `isAuthenticated` reactively becomes `true` — one source of
+truth instead of two code paths racing. Only surfaced through a real headless-browser session (Playwright)
+driving an actual login → navigation sequence; the underlying endpoints and cookie mechanics tested correctly in
+isolation both in `Management.Tests` and via `curl`.
+
 ### Rate limiting
 
 `Core/RateLimiting`: `ITokenRateLimiter`/`TokenRateLimiter` (the sliding-window-counter algorithm — a weighted
@@ -239,8 +300,20 @@ breakdown. **Verified live end-to-end**: made a real (failing, fake-key) request
 `usage_events` row landed in Postgres with the correct provider/model/status code, and confirmed `Management`'s
 usage endpoint reflected it correctly (1 request, 1 error, grouped under `"openai"`).
 
-- `src/Dashboard/` — React + TypeScript SPA (Vite), for tenant self-service. Currently the unmodified Vite
-  starter template, not wired to any API yet.
+- `src/Dashboard/` — React 19 + TypeScript SPA (Vite), for tenant self-service against `Management`. Stack:
+  TanStack Router (code-based routes in `src/routes.tsx`, not file-based — `@tanstack/router-plugin` was
+  deliberately not installed), TanStack Query (`src/lib/auth.tsx`, per-page data hooks), shadcn/ui + Tailwind
+  CSS v4 (`src/components/ui/*`, manually authored — not CLI-scaffolded, for environment-reliability reasons —
+  `src/index.css` has the theme tokens), Recharts (usage chart). `vite.config.ts` proxies `/api/**` to
+  `Management` (`http://localhost:5299`) so the browser talks same-origin — see "Sessions" above for why that
+  matters for cookies. `src/lib/api.ts` is a thin `fetch` wrapper (`credentials: 'include'` on every call,
+  `ApiError` with a `status` for callers to branch on 401s) with one function per `Management` endpoint.
+  `src/lib/auth.tsx`'s `AuthProvider`/`useAuth()` wraps the `GET /auth/session` query plus login/logout
+  mutations; `RequireAuth.tsx` redirects unauthenticated users to `/login`. Pages: `LoginPage`, `TenantsListPage`
+  (list + create-tenant dialog), `TenantDetailPage` (composes `QuotaCard`/`ApiKeysCard`/`ProvidersCard`/
+  `UsageCard` under `pages/tenant-detail/`). No automated test suite yet (open item in `ARCHITECTURE.md`) —
+  verified so far by `npm run build`/`npm run lint` plus live headless-browser driving (see "Sessions" above for
+  the one real bug that surfaced that way).
 - `src/Core.Tests/` — covers the tenant query-filter behavior, both provider clients incl. streaming (fake
   `HttpMessageHandler` + `FakeStreamResponseWriter`, no real network calls — including the error-before-streaming
   path for both providers), the Anthropic translators, both non-streaming (pure-function tests) and streaming
@@ -274,13 +347,22 @@ usage endpoint reflected it correctly (1 request, 1 error, grouped under `"opena
   `Program.cs` has `public partial class Program;` at the bottom specifically to make it accessible to
   `WebApplicationFactory<Program>` — keep that if you touch `Program.cs`.
 - `src/Management.Tests/` — `ManagementApiFactory` (shared `WebApplicationFactory<Program>`, same InMemory-DB
-  swap pattern as `Api.Tests`, plus an in-memory `ISecretStore` and its own test-owned `"StaticKey"` auth config)
+  swap pattern as `Api.Tests`, plus an in-memory `ISecretStore`, an `InMemorySessionStore` swapped in for
+  `ISessionStore` to avoid a real Redis dependency in tests, and its own test-owned `"StaticKey"` auth config)
   exposes `CreateAuthenticatedClient()` (an `HttpClient` pre-authenticated with a JWT minted via
   `LocalDevTokenIssuer`) alongside the inherited `CreateClient()` for testing the unauthenticated case. Endpoint
   tests per resource (`TenantsEndpointTests`, `ApiKeysEndpointTests`, `ProviderCredentialsEndpointTests`,
   `UsageEndpointTests`) all use the authenticated client; each also has (or `TenantsEndpointTests` has, covering
-  the shared filter) a test asserting `401` without a token. `UsageEndpointTests` seeds `UsageEvent` rows
-  directly (bypassing `Api`) and checks the aggregation/grouping/time-window-filtering math.
+  the shared filter) a test asserting `401` without a token, plus a test for its new `GET` list endpoint
+  (tenants ordered by name; API keys never exposing the hash/plaintext; providers reporting `configured` without
+  ever returning the secret value; 404s for an unknown tenant in each case). `UsageEndpointTests` seeds
+  `UsageEvent` rows directly (bypassing `Api`) and checks the aggregation/grouping/time-window-filtering math.
+  `AuthEndpointTests` covers the session lifecycle end-to-end within the test host: login with a valid token sets
+  a cookie that authenticates subsequent requests, an invalid token is rejected with no cookie set, logout
+  invalidates the session, `GET /auth/session` reflects current login state, and a bearer token still works with
+  no session cookie present (the dual-scheme path). Since `WebApplicationFactory`'s client has no automatic
+  cookie jar, these tests extract `Set-Cookie` from the login response and attach it manually via a `Cookie`
+  header on subsequent requests.
   **Gotcha already hit once:** generate the InMemory database name *once* (e.g. a field, computed outside the
   `AddDbContext` configure lambda) and reuse it — generating it inline inside the lambda (`UseInMemoryDatabase(Guid.NewGuid().ToString())`)
   means every time EF Core re-invokes that delegate you silently get a fresh, empty database, so data written by
@@ -392,3 +474,17 @@ tenant is the fix, not debugging decryption further.
 `DevTools` reads `Authentication:*` from `src/Api/appsettings.Development.json` by default (override with
 `--config <path>`) — both `Api` and `Management`'s dev configs share the same `Authentication:StaticKey` value
 so a token minted once works against either.
+
+### Running the Dashboard locally
+
+With Postgres/Redis up and `Management` running (above), start the Dashboard from `src/Dashboard`:
+
+```bash
+npm run dev   # http://localhost:5173, proxies /api/** to Management on :5299
+```
+
+Open `http://localhost:5173` — it redirects to `/login`. Paste a JWT minted the same way as the `curl` walkthrough
+above (`dotnet run --project src/DevTools -- mint-token 00000000-0000-0000-0000-000000000000`) into the login
+form; that exchanges it for a session cookie (see "Sessions" above) and lands on the tenant list. From there:
+create a tenant, click into its detail page, issue an API key, set a provider credential, and the usage chart
+renders once `Api` has recorded some `UsageEvent` rows for that tenant.
