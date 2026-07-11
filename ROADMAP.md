@@ -274,8 +274,42 @@ choices not yet made.
   the Dashboard would have 404'd on every API call in local dev. `CLAUDE.md`'s own command walkthroughs had the
   same stale `5299`/`5298` typo, copy-pasted from the wrong source; both fixed.
 
-## Phase 10 — Deployment hardening & follow-ons
-- [ ] Azure Container Apps deployment, managed Postgres + Redis
-- [ ] CD pipeline
-- [ ] Revisit open questions from `ARCHITECTURE.md`: billing/invoicing, pooled provider keys, per-tenant DB
-  isolation for compliance customers, additional providers (Azure OpenAI, etc.)
+## Phase 10 — Deployment artifacts
+- [x] Scope narrowed by explicit direction: this environment has no real Azure subscription/credentials, so the
+  deliverable is deployment *artifacts* (Dockerfiles, IaC, CD pipeline) verified as thoroughly as possible
+  locally — Docker builds, `docker compose` end-to-end runs, `az bicep build` syntax validation — rather than an
+  actual cloud deployment, which needs to happen separately with real credentials.
+- [x] `src/Api/Dockerfile`, `src/Management/Dockerfile` (multi-stage, build context `src/` for the shared `Core`
+  project dependency) and `src/Dashboard/Dockerfile` (node build → nginx runtime, build context
+  `src/Dashboard`). Found and fixed a real bug while verifying these build: `src/.dockerignore` needed
+  `**/bin`/`**/obj` (not just `bin`/`obj`, which only matches the context root) — without it, a developer's
+  local build artifacts (host-absolute paths baked into MSBuild's generated files) got copied into the image and
+  broke `dotnet publish` with a `NETSDK1064` error that looked like a restore problem but wasn't.
+- [x] `Dashboard`'s production topology — an open question carried since Phase 8 — resolved: nginx
+  (`nginx.conf.template`) reverse-proxies `/api/**` to `Management` same-origin, mirroring what
+  `vite.config.ts`'s dev-server proxy already does locally. No `Cors:AllowedOrigins`/`SameSite=None`
+  cross-origin cookie handling needed in either environment.
+- [x] `deploy/main.bicep`: Container Apps environment + Log Analytics, Postgres Flexible Server, Azure Cache for
+  Redis, a Key Vault for `AzureKeyVaultSecretStore` (tenant BYOK credentials — separate from the plain
+  Container-App-secret infra secrets like the DB connection string), and the three Container Apps with managed
+  identities granted Key Vault Secrets Officer. `az bicep build` clean (one syntax fix needed: an unescaped
+  apostrophe inside a single-quoted `@description` string).
+- [x] `.github/workflows/cd.yml`: builds + pushes all three images to GHCR on every push to `main` (harmless —
+  publishes build artifacts only) plus a `deploy` job that updates the Container Apps to match, gated on an
+  `AZURE_RESOURCE_GROUP` repo variable so it's a no-op (not a failure) until an environment actually exists to
+  deploy to.
+- [x] `docker-compose.full.yml`: a local smoke test running the actual images this pipeline builds, alongside
+  the existing Postgres/Redis compose services. **Verified live**: all three images build; the stack boots and
+  migrates; a real tenant-create → set-BYOK-credential → chat-completion-proxy flow round-trips correctly
+  end-to-end through the containers, including confirming the cross-process `LocalDevSecretStore` Data
+  Protection key-ring sharing (documented since Phase 4) also holds across separate *containers* on a shared
+  volume, not just separate local processes.
+- [x] `deploy/README.md` documents the full one-time-setup walkthrough (provision → migrate → wire GitHub↔Azure
+  OIDC federated credentials → push) and known simplifications not hardened in this pass: Postgres firewall
+  allows all Azure services rather than being VNet-scoped, `Management`'s Container App ingress is external
+  rather than internal-only, no custom domain.
+
+Deferred (not this phase, tracked in `ARCHITECTURE.md`'s open questions): actually running the deployment
+against a real Azure subscription; billing/invoicing, pooled provider keys, per-tenant DB isolation for
+compliance customers, additional providers (Azure OpenAI, etc.); the network-hardening items in
+`deploy/README.md`'s "Known simplifications".

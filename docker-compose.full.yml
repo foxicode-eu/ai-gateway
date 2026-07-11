@@ -1,0 +1,66 @@
+# Overlay on top of docker-compose.yml that runs the full containerized stack (Api + Management + Dashboard,
+# built from their Dockerfiles) alongside Postgres/Redis — a local smoke test that the images this repo ships
+# actually boot and talk to each other, distinct from `npm run dev`/`dotnet run` local dev (see CLAUDE.md).
+#
+#   docker compose -f docker-compose.yml -f docker-compose.full.yml up --build
+#   dotnet ef database update --project src/Core --startup-project src/Core   # apply migrations (from the host — see below)
+#
+# The `Authentication__StaticKey__SigningKey` below is a fixed, committed, dev-only value — never use it (or
+# `"StaticKey"` mode at all) outside local testing; see Core/Auth's doc comments.
+services:
+  api:
+    build:
+      context: ./src
+      dockerfile: Api/Dockerfile
+    depends_on: [postgres, redis]
+    environment:
+      ASPNETCORE_ENVIRONMENT: Production
+      ConnectionStrings__Gateway: "Host=postgres;Port=5432;Database=ai_gateway;Username=ai_gateway;Password=ai_gateway"
+      Secrets__Provider: LocalDev
+      Secrets__LocalDev__FilePath: /data/secrets.dev.json
+      RateLimiting__Store: Redis
+      RateLimiting__RedisConnectionString: "redis:6379"
+      Authentication__Mode: StaticKey
+      Authentication__Audience: ai-gateway
+      Authentication__StaticKey__Issuer: ai-gateway-local
+      Authentication__StaticKey__SigningKey: "ZGV2LW9ubHktc3RhdGljLWtleS1kby1ub3QtdXNlLWluLXByb2Q="
+      Observability__Exporter: Console
+    ports:
+      - "5116:8080"
+    volumes:
+      - local-secrets:/data
+
+  management:
+    build:
+      context: ./src
+      dockerfile: Management/Dockerfile
+    depends_on: [postgres, redis]
+    environment:
+      ASPNETCORE_ENVIRONMENT: Production
+      ConnectionStrings__Gateway: "Host=postgres;Port=5432;Database=ai_gateway;Username=ai_gateway;Password=ai_gateway"
+      Secrets__Provider: LocalDev
+      Secrets__LocalDev__FilePath: /data/secrets.dev.json
+      Sessions__Store: Redis
+      Sessions__RedisConnectionString: "redis:6379"
+      Sessions__CookieSecure: "false"
+      Authentication__Mode: StaticKey
+      Authentication__Audience: ai-gateway
+      Authentication__StaticKey__Issuer: ai-gateway-local
+      Authentication__StaticKey__SigningKey: "ZGV2LW9ubHktc3RhdGljLWtleS1kby1ub3QtdXNlLWluLXByb2Q="
+      Observability__Exporter: Console
+    ports:
+      - "5162:8080"
+    volumes:
+      - local-secrets:/data
+
+  dashboard:
+    build:
+      context: ./src/Dashboard
+    depends_on: [management]
+    environment:
+      MANAGEMENT_UPSTREAM: "http://management:8080"
+    ports:
+      - "8081:8080"
+
+volumes:
+  local-secrets:

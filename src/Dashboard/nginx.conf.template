@@ -1,0 +1,31 @@
+# Templated by the nginx image's built-in envsubst-on-startup (see Dockerfile) — ${MANAGEMENT_UPSTREAM} is the
+# only substituted variable; everything else (`$host`, `$uri`, ...) is a real nginx variable, left alone because
+# it isn't a container environment variable envsubst's substitution list is built from.
+#
+# Mirrors what vite.config.ts's dev-server proxy does in local dev: makes Dashboard and Management same-origin
+# from the browser's perspective, so the session cookie (HttpOnly, SameSite=Lax — see CLAUDE.md's "Sessions"
+# section) works without any cross-origin/CORS/SameSite=None complexity. This is the "reverse proxy" option
+# ARCHITECTURE.md's open-questions section flagged for production topology — resolved here as the default.
+#
+# MANAGEMENT_UPSTREAM is a full origin (scheme + host[:port], e.g. "http://management:8080" for
+# docker-compose.full.yml or "https://management.<env>.azurecontainerapps.io" in Azure) — no trailing path, so
+# nginx appends the (rewritten) request URI unchanged.
+server {
+    listen 8080;
+    root /usr/share/nginx/html;
+    index index.html;
+
+    location /api/ {
+        rewrite ^/api/(.*)$ /$1 break;
+        proxy_pass ${MANAGEMENT_UPSTREAM};
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    # SPA fallback — client-side routes (TanStack Router) resolve on the client, so any path that isn't a real
+    # static asset should still serve index.html rather than 404.
+    location / {
+        try_files $uri /index.html;
+    }
+}

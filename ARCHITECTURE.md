@@ -174,9 +174,24 @@ infrastructure is "in place for it," not just planned.
 
 ## Deployment
 
-- Target: **Azure** first (App Service or Container Apps), using managed Postgres and managed Redis (Azure
-  Cache for Redis). Containerize everything regardless, so a later move to Kubernetes (for cloud-agnostic or
-  air-gapped/on-prem deployments) doesn't require re-architecting — just a different orchestration layer.
+- Target: **Azure Container Apps**, using managed Postgres (Flexible Server) and managed Redis (Azure Cache for
+  Redis). Containerized regardless (`src/{Api,Management,Dashboard}/Dockerfile`), so a later move to Kubernetes
+  (for cloud-agnostic or air-gapped/on-prem deployments) doesn't require re-architecting — just a different
+  orchestration layer.
+- `deploy/main.bicep` provisions the Container Apps environment, Postgres, Redis, a Key Vault (for
+  `AzureKeyVaultSecretStore` — tenant BYOK credentials), and the three Container Apps with managed identities
+  granted Key Vault access. `.github/workflows/cd.yml` builds + pushes images to GHCR on every push to `main`
+  and updates the Container Apps to the new images once the deploy job's prerequisites are configured (inert
+  until then — see `deploy/README.md`). Structurally complete but **not verified against a real Azure
+  subscription** — no cloud credentials were available to build this against; only locally
+  `docker build`/`docker compose`-verified and `az bicep build`-validated. Treat it the same way this document
+  already treats `AzureKeyVaultSecretStore`: reasonably confident, not proven live. See `deploy/README.md` for
+  the full walkthrough, prerequisites, and known simplifications (Postgres firewall, `Management`'s ingress
+  being external rather than internal-only, no custom domain).
+- `Dashboard`'s production topology (previously an open question below) is resolved: it's served by nginx,
+  which reverse-proxies `/api/**` to `Management` same-origin (`src/Dashboard/nginx.conf.template`) — the exact
+  same choice local dev makes via the Vite dev-server proxy, so no `Cors:AllowedOrigins` configuration or
+  `SameSite=None` cross-origin cookie handling is needed in either environment.
 
 ## Testing & CI
 
@@ -194,11 +209,10 @@ infrastructure is "in place for it," not just planned.
   second delivery mechanism generally) is deferred, not ruled out.
 - When/whether to introduce schema- or database-per-tenant isolation for specific compliance-driven customers.
 - Pooled/gateway-owned provider key support (future reseller tier).
-- Production topology for `Dashboard` ↔ `Management`: local dev uses a same-origin Vite dev-server proxy (see
-  CLAUDE.md), sidestepping CORS/cookie cross-origin rules entirely. A real deployment needs an equivalent
-  same-origin arrangement (reverse proxy, or serve both from the same domain) or a properly configured
-  `Cors:AllowedOrigins` + `SameSite=None; Secure` cross-origin cookie setup — not decided which, since it
-  depends on the eventual hosting topology (Deployment section above is also not decided in enough detail yet).
+- Network hardening for the Azure deployment: Postgres currently allows all Azure-service IPs rather than being
+  locked to the Container Apps environment's outbound IPs (needs VNet integration + a NAT gateway), and
+  `Management`'s Container App ingress is external rather than internal-only, even though only `Dashboard`'s
+  nginx proxy needs to reach it. See `deploy/README.md`'s "Known simplifications".
 - Which managed IdP to actually use (Entra ID external tenants vs. Auth0 vs. other) — blocked on having a real
   account to build/verify dynamic per-tenant client registration against; the JWT *validation* side is IdP-agnostic
   and already built (see AuthN/AuthZ above), but nothing has exercised real OIDC discovery against a live IdP.

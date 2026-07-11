@@ -1,0 +1,5 @@
+**/bin
+**/obj
+**/*.user
+Dashboard/node_modules
+Dashboard/dist

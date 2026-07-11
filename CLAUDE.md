@@ -16,13 +16,16 @@ out of order. Read both before making structural decisions (new projects, auth f
 
 ## Current state
 
-Phases 0–9 are done (solution scaffolding, core domain + persistence, walking-skeleton proxy, multi-tenancy +
+Phases 0–10 are done (solution scaffolding, core domain + persistence, walking-skeleton proxy, multi-tenancy +
 BYOK credentials, JWT/managed-IdP auth, streaming, rate limiting, observability + usage data, Dashboard, quota
-alerting) — see `ROADMAP.md` for what's next. `Api` accepts both a JWT and a legacy hashed API key (see "AuthN"
-below — this is a deliberate, temporary dual-scheme, not an oversight). `Management` accepts both a session
-cookie and a bearer JWT — same deliberate dual-scheme idea, see "Sessions" below. Check `ROADMAP.md` before
-starting new work so you're building the current phase, not a later one out of order, and update it as phases
-complete. Update `ARCHITECTURE.md` too if you make a decision that resolves one of its "Open questions".
+alerting, deployment artifacts) — see `ROADMAP.md` for what's next. `Api` accepts both a JWT and a legacy hashed
+API key (see "AuthN" below — this is a deliberate, temporary dual-scheme, not an oversight). `Management`
+accepts both a session cookie and a bearer JWT — same deliberate dual-scheme idea, see "Sessions" below. Check
+`ROADMAP.md` before starting new work so you're building the current phase, not a later one out of order, and
+update it as phases complete. Update `ARCHITECTURE.md` too if you make a decision that resolves one of its "Open
+questions". Note Phase 10's deployment artifacts (`deploy/`, the three `Dockerfile`s, `.github/workflows/cd.yml`)
+were built and locally verified (`docker build`/`docker compose`/`az bicep build`) but **not exercised against a
+real Azure subscription** — no cloud credentials are available in this environment. See `deploy/README.md`.
 
 ## Solution structure
 
@@ -447,6 +450,44 @@ transitively via Npgsql/EFCore.Design) to avoid an assembly version conflict bet
 resolves and what EFCore.Design expects. If you add another EF-related package and see `MSB3277` conflict
 warnings, pin the conflicting package version in `Core.csproj` rather than in downstream projects.
 
+### Deployment
+
+Containerized per `ARCHITECTURE.md`'s Deployment section: `src/Api/Dockerfile`, `src/Management/Dockerfile`
+(both multi-stage, build context `src/` since they need the sibling `Core` project — only the two `.csproj`
+files this specific image needs are copied before `dotnet restore`, so unrelated-project changes don't bust the
+restore layer's cache) and `src/Dashboard/Dockerfile` (build context `src/Dashboard`, node build stage → static
+files served by nginx). **Gotcha already hit once, twice actually — bites any multi-stage .NET Dockerfile built
+from a parent directory:** `src/.dockerignore` must exclude `**/bin`/`**/obj`, not just `bin`/`obj` — the latter
+only matches at the build-context root, so a developer's local `Api/bin`/`Core/obj` (host-absolute paths baked
+into MSBuild's generated files) silently got copied into the image and broke `dotnet publish` with a
+`NETSDK1064: Package ... was not found` error that looked like a restore problem but wasn't. Caught by actually
+building the images, not just writing them.
+
+`Dashboard`'s nginx (`nginx.conf.template`, templated via the nginx image's built-in envsubst-on-startup)
+reverse-proxies `/api/**` to `Management` same-origin — the exact same choice `vite.config.ts`'s dev-server
+proxy makes locally, and the resolution to `ARCHITECTURE.md`'s former "production Dashboard↔Management
+topology" open question. `MANAGEMENT_UPSTREAM` (env var, full origin including scheme — `http://management:8080`
+for `docker-compose.full.yml`, an `https://` Container Apps FQDN in Azure) is the one substituted template
+variable; nginx's own variables (`$host`, `$uri`, ...) are untouched since they aren't container environment
+variables envsubst's substitution list is built from.
+
+`docker-compose.full.yml` is a local smoke test — the actual images above, wired to the same Postgres/Redis
+`docker-compose.yml` already provides — distinct from `npm run dev`/`dotnet run` local dev. **Verified working**:
+all three images build; the stack boots, migrates, and a real tenant-create → set-BYOK-credential →
+chat-completion-proxy flow round-trips correctly, including cross-*container* Data Protection key-ring sharing
+for `LocalDevSecretStore` (the same sharing `CLAUDE.md`'s `Secrets/` bullet already documents across separate
+*processes* — confirmed it also holds across separate *containers* on a shared volume). Its
+`Authentication__StaticKey__SigningKey` is a fixed, committed, dev-only value for this smoke test only.
+
+`deploy/main.bicep` provisions the real Azure target (Container Apps environment, Postgres Flexible Server,
+Azure Cache for Redis, Key Vault, the three Container Apps with managed identities granted Key Vault Secrets
+Officer) and `.github/workflows/cd.yml` builds+pushes images to GHCR on every push to `main`, then updates the
+Container Apps to match — **not run against a real subscription**, only `az bicep build`-validated for syntax
+and structurally reviewed; see `deploy/README.md` for the full setup walkthrough, prerequisites, and known
+simplifications. The CD workflow's `deploy` job is gated on an `AZURE_RESOURCE_GROUP` repo variable being set,
+so pushing to `main` today only builds+pushes images (harmless) and never attempts a deploy no environment has
+actually been provisioned for.
+
 ## Commands
 
 Run .NET commands from `src/` (where `Gateway.slnx` lives), or point `dotnet` at the `.slnx`/`.csproj` explicitly.
@@ -568,3 +609,18 @@ above (`dotnet run --project src/DevTools -- mint-token 00000000-0000-0000-0000-
 form; that exchanges it for a session cookie (see "Sessions" above) and lands on the tenant list. From there:
 create a tenant, click into its detail page, issue an API key, set a provider credential, and the usage chart
 renders once `Api` has recorded some `UsageEvent` rows for that tenant.
+
+### Running the full containerized stack locally
+
+A closer-to-production smoke test than the two commands above — runs the actual `Dockerfile`s (see
+"Deployment" above), not `dotnet run`/`npm run dev`:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.full.yml up --build -d
+dotnet ef database update --project src/Core --startup-project src/Core   # first run only, applies migrations
+```
+
+`http://localhost:5116` (Api), `http://localhost:5162` (Management), `http://localhost:8081` (Dashboard, behind
+its nginx reverse proxy). `docker compose -f docker-compose.yml -f docker-compose.full.yml down` to stop (add
+`-v` only if you also want to wipe the Postgres/Redis/secrets volumes — that deletes local dev data, not just
+this smoke test's).
